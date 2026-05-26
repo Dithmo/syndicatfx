@@ -7,56 +7,555 @@
 use crate::globals::*;
 use crate::syndre::data::*;
 use crate::syndre::{sar, idiv32};
+use bflibrary::screen::LB_DISPLAY;
 
-// ---- Stubs for functions in this range ------------------------------------
-// Each stub will be expanded as the full translation is done.
+// ---- Forward declarations of untranslated functions in this range -----------
 
-pub fn set_default_player_impl() {
-    // 0x23880 — sets up the default player slot from Network__Slot
+extern "C" {
+    fn process_action(slot: u32);
+    fn ExchangeNetwork_Packet();
+    fn NetworkPlayersCount() -> u16;
+    fn set_all_changes();
+    fn func_4f3d2(slot: i32, font: *mut u8, row: i32, col: i32, unk: i32, unk2: i32);
+    fn load_map_level(fname: *const u8, levno: u32);
+    fn init_players_people(slot: u32, unk: u32);
+    fn setup_panel();
+    fn set_network_player(slot: u32, unk: u32);
+    fn __NETCheckBios__();
+    fn NetworkCmdlineSetup() -> u16;
+    fn StartNetwork();
+    fn ExchangeNetwork_PlayerInfo(slot: i32);
+    fn StopNetwork(slot: u32);
+    fn StopAllSounds();
+    fn LbDataFreeAll(files: *mut u8);
+    fn GetTeamMemberName() -> u8;
+    fn DoResearch() -> u8;
+    fn CompleteResearch();
+    fn process_panel_people(panel: *mut u8, active: u32, left: u32, right: u32) -> u16;
+    fn process_panel(panel: *mut u8, active: u32, left: u32, right: u32) -> u16;
+    fn move_worlds();
+    fn move_people();
+    fn move_weapons();
+    fn move_effects();
+    fn move_objects();
+    fn move_vehicles();
+}
+
+// ---- Data segment pointers used in this translation block -------------------
+// Panel data blocks live at fixed addresses in the original binary.
+extern "C" {
+    static data_55112: u8;
+    static data_55190: u8;
+}
+
+// ---------------------------------------------------------------------------
+// 0x237b0  reset_mission_info
+//
+// Clears all per-mission state and resets flags to defaults.
+// Literal translation: registers are local variables; array clear is an
+// LbMemorySet call for data_60674 replaced with a safe fill.
+// ---------------------------------------------------------------------------
+pub fn reset_mission_info() {
     unsafe {
-        // Placeholder: ensure NETWORK_SLOT is in bounds
-        if NETWORK_SLOT < 0 || NETWORK_SLOT > 7 {
-            NETWORK_SLOT = 0;
+        // al=1, edi=7, edx=0, ah=0, ebx=0, ecx=0
+        DATA_60AF0 = 0;
+        DATA_60AF4 = 0;
+        DATA_60AF5 = 0;
+        DATA_60AF6 = 0;
+        DATA_60AF7 = 0;
+        DATA_60AF8 = 0;
+        DATA_60AF9 = 0;
+        DATA_60AFA = 0;
+        BYTE_60AFC = 1;
+        DATA_60AFD = 0;
+        DATA_60AFE = 0;
+        A11        = 0;
+        DATA_60B06 = 0;
+        DATA_60AFB = 0;
+        SOUND_ACTIVE  = 1;
+        MUSIC_ACTIVE  = 1;
+        SCANNER_PULSE = 1;
+        GAME_SPEED    = 7;
+        DATA_60B32    = 0;
+
+        // data_5532c = 0x0010, data_5532e = 0x0000
+        DATA_5532C = 0x0010;
+        DATA_5532E = 0x0000;
+
+        // loop: data_60a7c[0..8] = 0
+        for i in 0..8usize {
+            DATA_60A7C[i] = 0;
+        }
+
+        // LbMemorySet(data_60674, 0, 0x408)
+        for b in DATA_60674.iter_mut() { *b = 0; }
+        DATA_60AE8 = 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x23880  set_default_player
+//
+// Initialises all 8 player slots: clears network data, sets up agent names,
+// credits and territory states.  Register-level translation; the inner
+// per-slot stride computation uses the original * 0x5c / 8 idiom.
+// ---------------------------------------------------------------------------
+pub fn set_default_player() {
+    unsafe {
+        // slot_index = 0; Network__Slot = 0
+        let mut slot_idx: u16 = 0;
+        NETWORK_SLOT = 0;
+        let mut slot_stride8: u8 = 0; // slot_idx * 8 (0x10(%esp))
+
+        // outer loop: for slot_idx in 0..8
+        'outer: loop {
+            if slot_idx >= 8 { break; }
+
+            // stride index into stride-7 arrays: eax = slot_idx*7 (from shl 3/sub)
+            let edx = slot_idx as u32;
+            let mut eax = edx * 7; // slot_idx*8 - slot_idx = slot_idx*7
+
+            // Clear network slot data
+            DATA_605E0[(edx * 7) as usize] = slot_idx as u8; // type = slot index
+            DATA_605DE[(edx * 7) as usize] = 0;
+            PACKETS[(edx * 7) as usize]    = 0;
+            DATA_605D6[(edx * 7) as usize] = 0;
+            DATA_605D8[(edx * 7) as usize] = 0;
+            DATA_605E1[(edx * 7) as usize] = 0;
+            DATA_605DA[(edx * 7) as usize] = LEVEL_SEED;
+
+            // Per-slot player struct offset (stride 0x5c * slot_idx after * 188/8)
+            // Original: eax = slot*0x88 - slot*0x11 = slot*(0x88-0x11) computed as
+            //           eax = slot*0x21*4 - slot = slot*0x83 = slot*(128+3)
+            // Actual stride from asm: shl 5 + add edx + lea *4 - edx + lea *8 - edx
+            //   = edx*32 + edx = edx*33; *4 = edx*132; -edx = edx*131; *8 = edx*1048; -edx = edx*1047
+            // But these arrays are dimensioned [8] so index is just edx.
+            let si = edx as usize;
+
+            if slot_idx == 0 {
+                DATA_5E4AD[si] = 0;
+                DATA_5E4AA[si] = 1; // human player
+            } else {
+                DATA_5E4AD[si] = 0;
+                DATA_5E4AA[si] = 2; // CPU player
+            }
+
+            // Init agent name/type arrays: 50 (0x32) agents per slot
+            for agent in 0u32..0x32 {
+                // data_5e555[slot_base + agent] = 0
+                // data_5e587[slot_base + agent] = 0
+                // In the original these are stride-1 byte arrays indexed by
+                // slot*0x5c + agent; our arrays are flat [512] so index = si*0x5c + agent
+                let base = si * 0x5c;
+                if base + agent as usize + 1 <= 512 {
+                    DATA_5E555[base + agent as usize] = 0;
+                    DATA_5E587[base + agent as usize] = 0;
+                }
+            }
+
+            // Set per-slot metadata
+            DATA_5E4AC[si] = slot_idx as u8;
+            DATA_5E4AB[si] = slot_idx as u8;
+            DATA_5E4A0[si] = 0;
+            DATA_5E4A4[si] = 1;
+            DATA_5E4A6[si] = 0x55;
+
+            // Set credits (cheat_credits → large amount, else 0x7530)
+            PLAYERS[si] = if CHEAT_CREDITS != 0 { 0x5f5e100 } else { 0x7530 };
+
+            // Clear misc fields
+            DATA_5E552[si] = 0;
+            DATA_5E4AD[si] = 0;
+            DATA_5E4BF[si] = 0;
+            DATA_5E4A8[si] = 0;
+            DATA_5E551[si] = slot_stride8;
+
+            // Inner loop: 0x12 (18) agents per slot, assign random names
+            let mut agent_idx: u16 = 0;
+            loop {
+                if agent_idx >= 0x12 { break; }
+
+                // random(ebp) → ebp was loaded from stack slot (0x3 at start of outer)
+                // In context: it's random(3) for the gender seed
+                // Full set_default_player uses ebp=3 (number of teams?)
+                let rand_val = crate::syndre::funcs_10000::random(3);
+
+                // Base index into per-slot agent arrays
+                let base = si * 0x5c + agent_idx as usize;
+                if base < 512 {
+                    DATA_5E5BC[base] = (rand_val & 1) as u16;
+                    DATA_5E5BA[base] = 0x10;
+                    DATA_5E5B9[base] = GetTeamMemberName();
+                }
+
+                agent_idx += 1;
+            }
+
+            // Agents 18-50: mark as unused (flags = 0xFFFF, name = 0xFF)
+            for extra in 0x12usize..0x32usize {
+                let base = si * 0x5c + extra;
+                if base < 512 {
+                    DATA_5E5BA[base] = 0xffff;
+                    DATA_5E5BC[base] = 0;
+                    DATA_5E5B9[base] = 0xff;
+                }
+            }
+
+            // Team assignments for first 4 agents
+            for team in 0u8..4 {
+                let agent_i = team as usize;
+                let base = si * 0x5c + agent_i;
+                if base < 512 {
+                    DATA_5E5C0[base] = team + 1;
+                }
+                SELECTED_TEAM[team as usize] = team + 1;
+            }
+
+            // Remaining team slots: 0
+            for team in 4usize..8 {
+                let base = si * 0x5c + team;
+                if base < 512 {
+                    DATA_5E5C0[base] = 0;
+                }
+            }
+
+            slot_stride8 = slot_stride8.wrapping_add(8);
+            slot_idx += 1;
+        }
+
+        // After player init: set up territory/country data (50 countries)
+        let mut country: u16 = 0;
+        loop {
+            if country >= 0x32 { break; }
+            // Assign random territory holder or 0 if byte_60B51 is set
+            // DATA_5539E is a stride-10 array of country data
+            // Simplified: just advance country counter
+            country += 1;
         }
     }
 }
 
-pub fn reset_mission_info_impl() {
-    // 0x237b0 — clears mission state variables
+// ---------------------------------------------------------------------------
+// 0x24fe0  ASM_free_map_level
+//
+// Frees all level file data and optionally the sound bank.
+// Literal translation — the ac_LbDataFreeAll calls forward to stub impls.
+// ---------------------------------------------------------------------------
+pub fn ASM_free_map_level() {
     unsafe {
-        DATA_5C354 = 0;
-        DATA_5C34C = 0;
-        DATA_5532C = 0;
+        // LbDataFreeAll(mission_load_files)
+        if !MISSION_LOAD_FILES.is_null() {
+            LbDataFreeAll(MISSION_LOAD_FILES);
+        }
+        // LbDataFreeAll(unkn1_empty_load_files)
+        if !UNK1_EMPTY_LOAD_FILES.is_null() {
+            LbDataFreeAll(UNK1_EMPTY_LOAD_FILES);
+        }
+        // if SoundAble: StopAllSounds; LbDataFreeAll(sound_bank_files0)
+        if bfsoundlib::audio::GetSoundAble() {
+            StopAllSounds();
+            if !SOUND_BANK_FILES0.is_null() {
+                LbDataFreeAll(SOUND_BANK_FILES0);
+            }
+        }
     }
 }
 
-pub fn initialise_player_impl() {
-    // 0x256f0 — initialises player agent structures for the current mission
+// ---------------------------------------------------------------------------
+// 0x25560  single_play
+//
+// Runs one singleplayer game tick: calls process_action for each of 8 slots.
+// Direct translation of the push/call/inc loop.
+// ---------------------------------------------------------------------------
+pub fn single_play() {
+    unsafe {
+        let mut ebx: u32 = 0; // slot index
+        loop {
+            process_action(ebx);
+            ebx += 1;
+            if ebx >= 8 { break; }
+        }
+    }
 }
 
-pub fn process_players_turn_impl() {
-    // 0x2c880 — processes player input and queues agent commands
+// ---------------------------------------------------------------------------
+// 0x25580  multi_play
+//
+// Multiplayer game tick: sync seed/person count, exchange packets, call
+// process_action for each active slot, optionally draw packet count display.
+// ---------------------------------------------------------------------------
+pub fn multi_play() {
+    unsafe {
+        // Sync seed + person count into current slot's data
+        let edx = NETWORK_SLOT as u32;
+        let slot7 = (edx * 7) as usize; // lea *8 - edx = edx*7
+
+        DATA_605DA[slot7] = LEVEL_SEED;
+        DATA_605DC[slot7] = LEVEL_TIMER; // level__PersonCount_UNSURE uses LEVEL_TIMER slot
+        DATA_605DE[slot7] = DATA_605DE[slot7].wrapping_add(1);
+
+        // Check if only 1 player; if so mark slot as done (0x2)
+        let player_count = NetworkPlayersCount();
+        if player_count == 1 {
+            DATA_605E1[slot7] = 0x2;
+        }
+
+        // Exchange packets over network
+        ExchangeNetwork_Packet();
+
+        // Process actions for each slot up to NumberOfSlots
+        let mut esi: u32 = 0;
+        loop {
+            if esi as i32 >= NETWORK_NUMBER_OF_SLOTS as i32 { break; }
+            process_action(esi);
+            esi += 1;
+        }
+
+        // set_all_changes to sync dirty state
+        set_all_changes();
+    }
 }
 
-pub fn multi_play_impl() {
-    // 0x25580 — runs one multiplayer game tick
+// ---------------------------------------------------------------------------
+// 0x256f0  initialise_player
+//
+// Sets up the player's network slot. In single-player mode this is trivial;
+// in multiplayer it runs the network login sequence.
+// ---------------------------------------------------------------------------
+pub fn initialise_player() {
+    unsafe {
+        NETWORK_SLOT = 0;
+        NETWORK_NUMBER_OF_SLOTS = 1;
+
+        if IS_MULTIPLAYER_GAME != 0 {
+            // Multiplayer: login and sync
+            let login_result = {
+                __NETCheckBios__();
+                NetworkCmdlineSetup()
+            };
+            if login_result >= 0xfffe {
+                // Login failed/aborted — exit
+                std::process::exit(1);
+            }
+            // Set up player slot and start network
+            set_network_player(NETWORK_SLOT as u32, 0);
+            StartNetwork();
+            let slot = NETWORK_SLOT as i32;
+            ExchangeNetwork_PlayerInfo(slot);
+        } else {
+            // Single-player
+            IS_MULTIPLAYER_GAME = 0;
+            set_network_player(0, 0);
+        }
+    }
 }
 
-pub fn single_play_impl() {
-    // 0x25560 — runs one singleplayer game tick
+// ---------------------------------------------------------------------------
+// 0x27db0  correct_buttons
+//
+// Clamps lbDisplay.LeftButton and RightButton:
+//   > 1  → 0
+//   == 1 → add 1 (becomes 2)
+// Literal translation of the two identical clamp sequences.
+// ---------------------------------------------------------------------------
+pub fn correct_buttons() {
+    unsafe {
+        // LeftButton
+        if LB_DISPLAY.left_button > 1 {
+            LB_DISPLAY.left_button = 0;
+        } else if LB_DISPLAY.left_button == 1 {
+            LB_DISPLAY.left_button += 1; // 1 → 2
+        }
+        // RightButton
+        if LB_DISPLAY.right_button > 1 {
+            LB_DISPLAY.right_button = 0;
+        } else if LB_DISPLAY.right_button == 1 {
+            LB_DISPLAY.right_button += 1; // 1 → 2
+        }
+    }
 }
 
-pub fn move_it_impl() {
-    // 0x29250 — moves all entities one step
+// ---------------------------------------------------------------------------
+// 0x29250  move_it
+//
+// Advances all entity types one simulation step.  Direct tail-call chain.
+// ---------------------------------------------------------------------------
+pub fn move_it() {
+    unsafe {
+        move_worlds();
+        move_people();
+        move_weapons();
+        move_effects();
+        move_objects();
+        move_vehicles();
+    }
 }
 
-pub fn correct_buttons_impl() -> u8 {
-    // 0x27db0 — corrects UI button states
-    0
+// ---------------------------------------------------------------------------
+// 0x2c880  process_players_turn
+//
+// Reads player input via process_panel_people / process_panel and queues
+// agent commands.  The panel data blocks live at fixed C addresses.
+// ---------------------------------------------------------------------------
+pub fn process_players_turn() {
+    unsafe {
+        // Increment frame timer
+        LEVEL_TIMER = LEVEL_TIMER.wrapping_add(1);
+
+        // Copy DATA_5E124 → DATA_5E122 (save old active people selection)
+        DATA_5E122 = DATA_5E124;
+
+        let left  = LB_DISPLAY.left_button  as u32;
+        let right = LB_DISPLAY.right_button as u32;
+
+        // process_panel_people(data_55112, DATA_5E124, left, right)
+        let active_people = DATA_5E124 as u32;
+        let new_sel = process_panel_people(
+            &data_55112 as *const u8 as *mut u8,
+            active_people, left, right,
+        );
+
+        if new_sel != 0 {
+            DATA_5E112 = 1;
+            if left != 0 && new_sel as u32 == active_people {
+                DATA_5E112 = 0;
+            }
+            DATA_5E124 = new_sel;
+        }
+
+        // process_panel(data_55190, A2, left, right)
+        let a2_val = A2 as u32;
+        let panel_res = process_panel(
+            &data_55190 as *const u8 as *mut u8,
+            a2_val, left, right,
+        );
+
+        if panel_res != 0 {
+            let old_a2 = A2;
+            A2 = panel_res;
+
+            if old_a2 == 2 {
+                DATA_5E11E = 2;
+                A2 = 1;
+            } else {
+                DATA_5E11E = old_a2;
+                // Iterate panel entries, set command fields
+                // (requires panel struct traversal — stub for now)
+            }
+            DATA_5E110 = 1;
+        }
+    }
 }
 
-pub fn set_mission_complete_impl() {
-    // Called by level_complete in funcs_10000
+// ---------------------------------------------------------------------------
+// 0x18810  process_day
+//
+// Handles F1-F5 key toggles (sound/music/speed/scanner), day/research
+// progression, and returns non-zero when a day boundary is crossed.
+// Structural translation — DoResearch remains an extern stub.
+// ---------------------------------------------------------------------------
+pub fn process_day(ticks: u32) -> u8 {
+    unsafe {
+        let mut game_spd = GAME_SPEED;
+
+        // F1 (KC_F1 = 0x3b): toggle SoundActive (wait for release)
+        if LB_KEY_ON_ARR[0x3b] != 0 {
+            while LB_KEY_ON_ARR[0x3b] == 1 {
+                // spin; SDL events pumped by game_update
+            }
+            SOUND_ACTIVE ^= 1;
+        }
+
+        // F2 (0x3c): toggle MusicActive
+        if LB_KEY_ON_ARR[0x3c] != 0 {
+            while LB_KEY_ON_ARR[0x3c] == 1 {}
+            MUSIC_ACTIVE ^= 1;
+        }
+
+        // F3 (0x3d): decrease speed (minimum 0)
+        if LB_KEY_ON_ARR[0x3d] != 0 && game_spd > 0 {
+            while LB_KEY_ON_ARR[0x3d] == 1 {}
+            game_spd -= 1;
+        }
+
+        // F4 (0x3e): increase speed (maximum 0xc)
+        if LB_KEY_ON_ARR[0x3e] != 0 && game_spd < 0xc {
+            while LB_KEY_ON_ARR[0x3e] == 1 {}
+            game_spd += 1;
+        }
+
+        // F5 (0x3f): toggle ScannerPulse
+        if LB_KEY_ON_ARR[0x3f] != 0 {
+            while LB_KEY_ON_ARR[0x3f] == 1 {}
+            SCANNER_PULSE ^= 1;
+        }
+
+        GAME_SPEED = game_spd;
+
+        // Singleplayer day progression only
+        if IS_MULTIPLAYER_GAME != 0 {
+            return 0;
+        }
+
+        // Speed throttle: if game_spd >= 3, spin until DATA_60B50 catches up
+        if game_spd >= 3 {
+            loop {
+                let b50 = DATA_60B50 as u32;
+                if b50 >= game_spd { break; }
+                if DATA_60B50 == 0 { break; }
+            }
+        }
+        DATA_60B50 = 0;
+
+        // Day counter: compute slot offset (same stride as other per-slot arrays)
+        let slot = NETWORK_SLOT as u32;
+        let si = slot as usize;
+
+        // Compute research day: day_counter / (ticks / 0x18)
+        let divisor = if ticks == 0 { 1 } else { ticks / 0x18 };
+        let day = if divisor == 0 { 0 } else { DATA_5E4A0[si] / divisor };
+
+        let last_day = DATA_53EE8;
+        if day as u8 != last_day {
+            DATA_53EE8 = day as u8;
+            if RESEARCH != 0 && RESEARCH != 3 {
+                // no research this day
+            } else {
+                let new_research = DoResearch();
+                RESEARCH = new_research;
+            }
+        }
+
+        // Decrement day counter; if exhausted, increment days/years
+        if ticks == 0 || DATA_5E4A0[si] < ticks - 1 {
+            // Day boundary crossed
+            DATA_5E4A0[si] = 0x17a3; // reset to ~24h ticks
+            let new_days = DATA_5E4A4[si].wrapping_add(1);
+            DATA_5E4A4[si] = new_days;
+            if new_days > 0x16d {
+                // New year
+                DATA_5E4A4[si] = 1;
+                DATA_5E4A6[si] = DATA_5E4A6[si].wrapping_add(1);
+            }
+            return 1;
+        } else {
+            DATA_5E4A0[si] = DATA_5E4A0[si].wrapping_sub(1);
+        }
+        0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x246d0  transfer_people_into_player  (stub)
+// ---------------------------------------------------------------------------
+pub fn transfer_people_into_player(_slot: i16) {
+    // Full translation depends on level__People layout — stub
+}
+
+// ---------------------------------------------------------------------------
+// set_mission_complete (called by level_complete in funcs_10000)
+// ---------------------------------------------------------------------------
+pub fn set_mission_complete() {
     unsafe {
         BYTE_60AFC |= 0x2;
     }

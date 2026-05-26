@@ -3,14 +3,14 @@
 use bfsoundlib::audio::{AudioInitOptions, InitAudio, FreeAudio,
                          GetSoundAble, GetSoundActive,
                          AUDIO_ABLE_MUSIC, AUDIO_ABLE_SOUND};
-use bfsoundlib::music::{InitMIDI, ShutdownMIDI,
-                         BFMidiPauseSong, BFMidiResumeSong};
+use bfsoundlib::music::{InitMIDI, ShutdownMIDI};
 use bfsoundlib::samples::{PlaySampleFromAddress, PauseAllSamples, ResumeAllSamples,
                             FULL_VOL, EQUL_PAN, NORM_PTCH};
 use crate::globals::*;
 
-// Re-export music functions so game.rs can call them by name
-pub use bfsoundlib::music::{BFMidiStartMusic, BFMidiStopMusic, BFMidiIsMusicPlaying};
+// Re-export music functions so game.rs / syndre can call them by name
+pub use bfsoundlib::music::{BFMidiStartMusic, BFMidiStopMusic, BFMidiIsMusicPlaying,
+                             BFMidiPauseSong, BFMidiResumeSong};
 pub use bfsoundlib::audio::GetMusicAble;
 
 // ---- BFSample / BFSampleStatus (mirroring sound.h structs) ----------------

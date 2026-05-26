@@ -1,0 +1,14 @@
+[package]
+name = "syndicatfx"
+version = "0.0.6"
+edition = "2021"
+
+[[bin]]
+name = "syndicatfx"
+path = "src/main.rs"
+
+[dependencies]
+bflibrary  = { path = "../bflibrary" }
+bfsoundlib = { path = "../bfsoundlib" }
+sdl2       = { version = "0.37" }
+libc       = "0.2"

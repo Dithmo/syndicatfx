@@ -16,3 +16,5 @@ ltmain.sh
 missing
 *~
 test-driver
+/rust-port/target/
+/rust-port/Cargo.lock

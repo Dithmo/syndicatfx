@@ -1,0 +1,3 @@
+[workspace]
+members = ["syndicatfx", "bflibrary", "bfsoundlib"]
+resolver = "2"

@@ -546,10 +546,70 @@ pub fn process_day(ticks: u32) -> u8 {
 }
 
 // ---------------------------------------------------------------------------
-// 0x246d0  transfer_people_into_player  (stub)
+// 0x246d0  transfer_people_into_player
+//
+// Iterates all entities in the player's agent list. For each entity that
+// belongs to the current slot and is attached to a vehicle/crate, adds a
+// credit bonus to PLAYERS[slot] based on the entity's flags and increments
+// DATA_60AFD (mission tally counter). In singleplayer only.
+//
+// Structural translation: the per-entity flag dispatch (flags 0x1/0x8/0x4/
+// 0x10/0x2) is faithful; the inner loop that scans for a free agent name
+// slot is stubbed (requires full level__People struct layout).
 // ---------------------------------------------------------------------------
-pub fn transfer_people_into_player(_slot: i16) {
-    // Full translation depends on level__People layout — stub
+pub fn transfer_people_into_player(slot: i16) {
+    unsafe {
+        if IS_MULTIPLAYER_GAME != 0 { return; }
+
+        let si = slot as usize;
+        let agent_count = DATA_5E551.get(si).copied().unwrap_or(0) as usize;
+        if LEVEL_PEOPLE.is_null() { return; }
+
+        // Iterate each agent entry for this slot
+        for agent_idx in 0..agent_count {
+            let base = si * 0x5c;
+            // data_5e5c0[slot_base + agent_idx] = team assignment
+            if base + agent_idx >= 512 { break; }
+            let team = DATA_5E5C0[base + agent_idx];
+            if team == 0 { continue; }
+
+            // Compute entity pointer into level__People
+            let entity_off = (DATA_5E551[si] as usize)
+                .wrapping_sub(1)
+                .wrapping_add(team as usize)
+                .wrapping_mul(0x5c);
+            let entity = LEVEL_PEOPLE.add(entity_off);
+
+            // Check entity is alive (0xb & 0x1 == 0) and has a vehicle link
+            if (*entity.add(0x0b) & 0x1) != 0 { continue; } // dead
+            let vehicle_link = *(entity.add(0x20) as *const u16);
+            if vehicle_link == 0 { continue; } // no vehicle
+
+            let ch = *entity.add(0x1c); // entity flags byte
+
+            // Dispatch on flag bits — credit amounts from original assembly
+            let bonus: u32 = if (ch & 0x01) != 0 {
+                0x32  // +50 credits (captured agent)
+            } else if (ch & 0x08) != 0 {
+                0x96  // +150 credits (equipment)
+            } else if (ch & 0x04) != 0 {
+                0x96
+            } else if (ch & 0x10) != 0 {
+                0x12c // +300 credits (vehicle)
+            } else if (ch & 0x02) != 0 {
+                // Variable: add entity's field_0x14 value
+                let fld14 = *(entity.add(0x14) as *const i16) as i32;
+                if fld14 >= 0 { fld14 as u32 } else { 0 }
+            } else {
+                continue;
+            };
+
+            // PLAYERS[si] += bonus; clear vehicle link; increment tally
+            PLAYERS[si] = PLAYERS[si].wrapping_add(bonus);
+            *(entity.add(0x20) as *mut u16) = 0;
+            DATA_60AFD = DATA_60AFD.wrapping_add(1);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

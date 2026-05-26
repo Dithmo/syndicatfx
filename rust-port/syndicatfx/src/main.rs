@@ -166,7 +166,9 @@ fn main() {
         }
 
         syndre::funcs_10000::ApSpriteSetup_ForceHeight(
-            POINTER_SPRITES, POINTER_SPRITES_END, POINTER_DATA);
+            POINTER_SPRITES as *mut u8,
+            POINTER_SPRITES_END as *mut u8,
+            POINTER_DATA);
         MOUSE_SWAP = 1;
 
         // read_gui_strings_file(); — stub

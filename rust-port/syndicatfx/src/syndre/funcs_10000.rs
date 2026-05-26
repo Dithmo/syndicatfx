@@ -435,17 +435,152 @@ pub fn menu_select() -> u8 {
     crate::syndre::funcs_30000::menu_select_impl()
 }
 
-// draw_panel, click_map, level_finished — stubs until funcs_30000 is translated
+// draw_panel — stub; 0x2d0e0 is ~15k lines of panel drawing code
 pub fn draw_panel() {}
-pub fn click_map() {}
-pub fn level_finished() {}
 
-pub fn ApSpriteSetup_ForceHeight(start: *mut bflibrary::TbSprite,
-                                   end:   *mut bflibrary::TbSprite,
-                                   data:  *mut u8) -> *mut i32 {
-    // 0x27c60 — adjusts sprite height tables; stub
-    let _ = (start, end, data);
-    std::ptr::null_mut()
+// level_finished — implemented in funcs_30000
+pub fn level_finished() {
+    crate::syndre::funcs_30000::level_finished_impl();
+}
+
+// ---------------------------------------------------------------------------
+// ApSpriteSetup_ForceHeight — 0x27c60
+//
+// Iterates sprite table [start, end) by 6-byte stride.
+// When DRAW_FLAGS >= 2: adds (data + 0x14) to the sprite's 4-byte Data field
+// and forces SHeight = 0x20.
+// Uses raw byte arithmetic to match the original 6-byte TbSprite layout
+// (Data:u32 at 0, SWidth:u8 at 4, SHeight:u8 at 5) regardless of the Rust
+// struct representation.
+// ---------------------------------------------------------------------------
+pub fn ApSpriteSetup_ForceHeight(start: *mut u8, end: *mut u8, data: *mut u8) {
+    unsafe {
+        if DRAW_FLAGS < 2 { return; }
+
+        let data_offset = (data as usize).wrapping_add(0x14);
+        let mut ptr = start;
+        while (ptr as usize) < (end as usize) {
+            // Original: mov (%eax),%esi; add %edx,%esi; mov %esi,(%eax)
+            // The Data field is a 4-byte little-endian pointer/offset at offset 0.
+            let field = ptr as *mut u32;
+            *field = (*field).wrapping_add(data_offset as u32);
+            // movb $0x20, 0x5(%eax)
+            *ptr.add(5) = 0x20;
+            ptr = ptr.add(6); // stride = sizeof(TbSprite) in original C
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// click_map — 0x11ea0
+//
+// Converts mouse screen coordinates to map-tile world coordinates, looks up
+// the block type at that tile, then updates the cursor mode (DATA_60B0E) and
+// the click-position registers (DATA_60B1E/DATA_60B20/DATA_60B1C).
+//
+// Coordinate transform (from screen to isometric world):
+//   half_x  = (mmouse_x − 0x80) >> 1
+//   world_z = ((player_view_y * 16) + mmouse_y − half_x) * 8
+//   world_x = ((player_view_x * 16) + mmouse_y + half_x) * 8
+// ---------------------------------------------------------------------------
+pub fn click_map() {
+    unsafe {
+        let bx = DATA_60B20; // save previous click x
+        let si = DATA_60B1E; // save previous click y
+
+        let mm_x = LB_DISPLAY_MMOUSE_X_640 as i32;
+        let mm_y = LB_DISPLAY_MMOUSE_Y_400 as i32;
+
+        // tile_sub_x = (mm_x − 0x80) & 0x1f
+        let tile_sub_x = ((mm_x - 0x80) & 0x1f) as u32;
+        // tile_sub_y = mm_y & 0x0f
+        let tile_sub_y = (mm_y & 0x0f) as u32;
+
+        // World coords (isometric 2:1 projection)
+        let half_x = (mm_x - 0x80) >> 1;
+        let world_z = (((PLAYER_VIEW_MAP_Y as i32) * 16) + mm_y - half_x) * 8;
+        let world_x = (((PLAYER_VIEW_MAP_X as i32) * 16) + mm_y + half_x) * 8;
+
+        // func_4a336 would do the map-cell lookup; result stored in DATA_60AAC.
+        // Until fully translated, zero the result so nothing spuriously selects.
+        DATA_60AAC = 0;
+        func_4a336_stub(world_x as u32, world_z as u32, tile_sub_x, tile_sub_y);
+
+        // Decode DATA_60AAC → tile column / row
+        let aac = DATA_60AAC;
+        let column = ((aac >> 7) / 0x60) as u32;
+        let (row, _) = (aac / 0x3000, aac % 0x3000);
+        let tile_x_pos = ((row as i32) << 7) + ((aac & 0x7f) as i32) + 0x80;
+
+        DATA_60B1C = (tile_x_pos & 0xffff) as u16;
+
+        let mode = DATA_60B18;
+        if mode > 5 {
+            // No valid click mode: leave cursor unchanged
+            DATA_60B1E = si;
+            DATA_60B20 = bx;
+            return;
+        }
+
+        // Adjusted tile sub-coords from the vtable_11e40 dispatch
+        // (each case 0-5 selects a different (tile_sub_x, tile_sub_y) variant)
+        let (adj_y, adj_x) = click_map_sub_coords(mode, tile_sub_x, tile_sub_y);
+
+        // Compute block address into map
+        if DATA_55358.is_null() { return; }
+        let map_col = (adj_y.wrapping_add(adj_x * 2)) as i32;
+        let map_row_off = {
+            // idiv 0x6000 to get row; remainder-based scale
+            let v = si as i32;
+            v.wrapping_div(0x6000)
+        };
+        let block_x_idx = {
+            let bx_adj = (bx as i32) ^ (map_row_off);
+            (bx_adj.wrapping_div(256)) as i32
+        };
+
+        // Look up the map cell and block type
+        let map_off = ((column as i32).wrapping_mul(4)
+            .wrapping_add((row as i32).wrapping_mul(0x80).wrapping_mul(4))) as usize;
+
+        if map_off + 4 > 0x40000 { return; } // bounds guard
+
+        let cell_ptr = *(DATA_55358.add(map_off) as *const u32) as usize;
+        if cell_ptr == 0 { return; }
+
+        // DATA_60B0E = 0 by default (no action)
+        DATA_60B0E = 0;
+
+        // Update click world position
+        DATA_60B1E = (adj_y as i16) as u16;
+        DATA_60B20 = (adj_x as i16) as u16;
+    }
+}
+
+// Stub for func_4a336 (map cell lookup) — fills DATA_60AAC when translated
+fn func_4a336_stub(world_x: u32, world_z: u32, sub_x: u32, sub_y: u32) {
+    let _ = (world_x, world_z, sub_x, sub_y);
+    // Full translation pending
+}
+
+// Returns (adj_sub_y, adj_sub_x) for each vtable_11e40 case (click mode 0-5)
+fn click_map_sub_coords(mode: u16, tile_sub_x: u32, tile_sub_y: u32) -> (u32, u32) {
+    // vtable_11e40 dispatches based on DATA_60B18, modifying edi (sub_y) and
+    // the stack slot 0x4(%esp) (sub_x) before falling to jump_11fcf.
+    // Cases mirror the original dispatch table entries:
+    let ty_lo  = tile_sub_y;
+    let ty_hi  = tile_sub_y.wrapping_add(0x10);
+    let ty_hi2 = tile_sub_y.wrapping_add(0x20);
+    let tx_lo  = tile_sub_x.wrapping_sub(0x20);
+    match mode {
+        0 => (ty_lo,   tx_lo),   // func_11fb7: restore edi from stack[0]
+        1 => (ty_lo,   tx_lo),   // func_11fb7 same
+        2 => (ty_hi2,  tx_lo),   // func_11fc0: edi = ecx = ty+0x20
+        3 => (ty_lo,   tx_lo),   // func_11fc8: edi = stack[0]
+        4 => (ty_hi2,  tx_lo),   // func_11fcd: edi = ecx
+        5 => (ty_hi,   tx_lo),   // fall-through to jump_11fcf
+        _ => (tile_sub_y, tile_sub_x),
+    }
 }
 
 // ---------------------------------------------------------------------------

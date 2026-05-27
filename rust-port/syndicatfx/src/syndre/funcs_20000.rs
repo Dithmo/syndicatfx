@@ -977,6 +977,73 @@ pub fn move_mapwho(entity: *mut u8, mut new_x: i16, mut new_y: i16, new_z: i16) 
 }
 
 // ---------------------------------------------------------------------------
+// 0x25020  set_structure_ends
+//
+// Scans the people, vehicle, and object arrays backward from the last slot
+// to find the first used entry from the end; stores these as LAST_PERSON,
+// LAST_VEHICLE, and LAST_OBJECT so movement loops have a tight upper bound.
+//
+// Default (if BYTE_60B42 != 0 or LEVEL_PEOPLE is null): end = next-array start.
+// Each people slot stride = 0x5c, vehicles = 0x2a, objects = 0x1e.
+//
+// Literal translation of the three backward-scan loops.
+// ---------------------------------------------------------------------------
+pub fn set_structure_ends() {
+    unsafe {
+        if LEVEL_PEOPLE.is_null() { return; }
+
+        let mut last_person  = LEVEL_VEHICLES;
+        let mut last_vehicle = LEVEL_OBJECTS;
+        let mut last_object  = LEVEL_WEAPONS;
+
+        if BYTE_60B42 == 0 {
+            // --- scan people backwards (stride 0x5c) ---
+            const PERSON_STRIDE: usize = 0x5c;
+            if !LEVEL_VEHICLES.is_null() && (LEVEL_VEHICLES as usize) >= (LEVEL_PEOPLE as usize) + PERSON_STRIDE {
+                let mut off = (LEVEL_VEHICLES as usize) - (LEVEL_PEOPLE as usize) - PERSON_STRIDE;
+                loop {
+                    let slot = LEVEL_PEOPLE.add(off);
+                    if *slot.add(0x18) != 0 { break; }
+                    last_person = slot;
+                    if off < PERSON_STRIDE { break; }
+                    off -= PERSON_STRIDE;
+                }
+            }
+
+            // --- scan vehicles backwards (stride 0x2a) ---
+            const VEHICLE_STRIDE: usize = 0x2a;
+            if !LEVEL_OBJECTS.is_null() && (LEVEL_OBJECTS as usize) >= (LEVEL_VEHICLES as usize) + VEHICLE_STRIDE {
+                let mut off = (LEVEL_OBJECTS as usize) - (LEVEL_VEHICLES as usize) - VEHICLE_STRIDE;
+                loop {
+                    let slot = LEVEL_VEHICLES.add(off);
+                    if *slot.add(0x18) != 0 { break; }
+                    last_vehicle = slot;
+                    if off < VEHICLE_STRIDE { break; }
+                    off -= VEHICLE_STRIDE;
+                }
+            }
+
+            // --- scan objects backwards (stride 0x1e) ---
+            const OBJECT_STRIDE: usize = 0x1e;
+            if !LEVEL_WEAPONS.is_null() && (LEVEL_WEAPONS as usize) >= (LEVEL_OBJECTS as usize) + OBJECT_STRIDE {
+                let mut off = (LEVEL_WEAPONS as usize) - (LEVEL_OBJECTS as usize) - OBJECT_STRIDE;
+                loop {
+                    let slot = LEVEL_OBJECTS.add(off);
+                    if *slot.add(0x18) != 0 { break; }
+                    last_object = slot;
+                    if off < OBJECT_STRIDE { break; }
+                    off -= OBJECT_STRIDE;
+                }
+            }
+        }
+
+        LAST_OBJECT  = last_object;
+        LAST_VEHICLE = last_vehicle;
+        LAST_PERSON  = last_person;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 0x252b0  load_map_level
 //
 // Loads a mission level. Formats the level number as two decimal digits into

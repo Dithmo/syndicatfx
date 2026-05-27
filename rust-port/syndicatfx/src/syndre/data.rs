@@ -110,12 +110,37 @@ pub static mut COMP_PLYR_TEAM_SIZE:         u8  = 0;
 pub static mut COMPUTER_PLAYERS_COUNT:      u8  = 0;
 
 // ---- Animation / wind state -------------------------------------------------
+pub static mut DATA_9BC72: i16 = 0;
+pub static mut DATA_9BC74: u16 = 0;
 pub static mut DATA_9BC76: u8  = 0x14;
 pub static mut DATA_9BC77: u8  = 0x10;
 pub static mut DATA_9BC78: u8  = 0;
 pub static mut DATA_9BC79: u8  = 1;
-pub static mut DATA_9BC72: i16 = 0;
+pub static mut DATA_9BC7A: u8  = 0x28;
+pub static mut DATA_9BC7B: u8  = 0x0a;
 pub static mut LEVEL_WORLDS: i16 = 0; // level__Worlds
+
+// ---- Level boundary (level__LoBoundaryy / HiBoundaryy etc.) ----------------
+pub static mut LEVEL_LOBOUNDARYY: i16 = 0x12;
+pub static mut LEVEL_HIBOUNDARYX: i16 = 0xca_u16 as i16;
+pub static mut LEVEL_HIBOUNDARYY: i16 = 0xda_u16 as i16;
+
+// ---- Level palette index table (level_palettes at 0x54170) -----------------
+// Indexed by current level number (0-based); values 1-5 select the palette.
+pub static LEVEL_PALETTES: [u8; 52] = [
+    1,2,3,4,5, 1,2,3,4,5, 1,2,3,4,5, 1,2,3,4,5,
+    1,2,3,4,5, 1,2,3,4,5, 1,2,3,4,5, 1,2,3,4,5,
+    1,2,3,4,5, 1,2,3,4,5, 0,0,
+];
+
+// ---- Misc level init counter (data_60ac8) ----------------------------------
+pub static mut DATA_60AC8: u32 = 0;
+
+// ---- Sprite table slots adjacent to h_sprites (data_5531c/55320/55334) ----
+// These are pointer slots in the sprite table block; filled during init.
+pub static mut DATA_5531C: *mut u8 = std::ptr::null_mut();
+pub static mut DATA_55320: *mut u8 = std::ptr::null_mut();
+pub static mut DATA_55334: *mut u8 = std::ptr::null_mut();
 
 // ---- Level entity pointers --------------------------------------------------
 // Subarray pointers into the level data block; set by init_level_data.

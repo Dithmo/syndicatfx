@@ -41,6 +41,9 @@ extern "C" {
     fn check_for_on_coming_cars(x: i32, y: i32, z: i32) -> u16;
     fn there_is_a_road_here(x: i32, y: i32, z: i32) -> u16;
     fn auto_weapon(entity: *mut u8) -> u16;
+    // move_vehicles helpers
+    fn vehicle_moving(entity: *mut u8, arg: i32);
+    fn vehicle_on_fire(entity: *mut u8, arg: i32);
 }
 
 // ---------------------------------------------------------------------------
@@ -2954,6 +2957,188 @@ pub fn move_people_impl() {
 
             ebx = ebx.add(0x5c);
             if ebx >= LAST_PERSON {
+                break;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x39890  move_vehicles
+//
+// Per-frame vehicle update loop (stride 0x2a).  For each active entry:
+//   • if field_0x20 != 0 (mounted entity), position = mounted entity coords
+//     + vehicle offsets 0x22/0x24/0x26; else use vehicle's own 0x4/0x6/0x8.
+//   • call move_mapwho with the updated DATA_60B28/2A/2C.
+//   • dispatch on field_0x19 (state 0x00-0x2b) to compute animation frame
+//     index esi using the same signed-round-divide pattern throughout.
+//   • epilogue: if esi changed and esi != 0, store STARTS_ANI[esi] to
+//     field_0x10 and esi to field_0x12.
+// ---------------------------------------------------------------------------
+pub fn move_vehicles_impl() {
+    use crate::syndre::funcs_20000::{animate_model, move_mapwho};
+    unsafe {
+        let mut ebx = LEVEL_VEHICLES;
+        if ebx.is_null() || ebx >= LAST_VEHICLE {
+            return;
+        }
+        loop {
+            if *ebx.add(0x18) != 0 {
+                // Position: from mounted entity or self
+                let mounted = *(ebx.add(0x20) as *const u16) as usize;
+                if mounted != 0 {
+                    let edx = LEVEL_THINGS_BASE.add(mounted);
+                    let cx = *(ebx.add(0x22) as *const i16) as i32;
+                    let di = *(ebx.add(0x24) as *const i16) as i32;
+                    let dx2 = *(ebx.add(0x26) as *const i16) as i32;
+                    DATA_60B28 = (*(edx.add(0x4) as *const i16) as i32 + cx) as i16;
+                    DATA_60B2A = (*(edx.add(0x6) as *const i16) as i32 + di) as i16;
+                    DATA_60B2C = (*(edx.add(0x8) as *const i16) as i32 + dx2) as i16;
+                    move_mapwho(ebx, DATA_60B28, DATA_60B2A, DATA_60B2C);
+                } else {
+                    DATA_60B28 = *(ebx.add(0x4) as *const i16);
+                    DATA_60B2A = *(ebx.add(0x6) as *const i16);
+                    DATA_60B2C = *(ebx.add(0x8) as *const i16);
+                }
+
+                // State dispatch (vtable_397d8, states 0x00-0x2b)
+                let state = *ebx.add(0x19);
+                let angle = *ebx.add(0x1a) as i32;
+                let esi: u32 = if state <= 0x2b {
+                    match state {
+                        0x00 => 0,
+                        0x01 | 0x02 => {
+                            vehicle_moving(ebx, 3);
+                            ((angle + 0x10) >> 5 & 7) as u32 + 0x190
+                        }
+                        0x03 => {
+                            vehicle_on_fire(ebx, 0x249f0);
+                            ((angle + 0x20) >> 6 & 3) as u32 + 0x198
+                        }
+                        0x04 => {
+                            animate_model(ebx);
+                            ((angle + 0x20) >> 6 & 3) as u32 + 0x19c
+                        }
+                        0x05 | 0x06 => {
+                            vehicle_moving(ebx, 7);
+                            ((angle + 0x20) >> 6 & 3) as u32 + 0x1a0
+                        }
+                        0x07 => {
+                            vehicle_on_fire(ebx, 0x1e8480);
+                            ((angle + 0x20) >> 6 & 3) as u32 + 0x1a4
+                        }
+                        0x08 => {
+                            animate_model(ebx);
+                            ((angle + 0x20) >> 6 & 3) as u32 + 0x1a8
+                        }
+                        0x09 | 0x0a => {
+                            vehicle_moving(ebx, 0xb);
+                            let v = (angle + 0x20) >> 6 & 1;
+                            match *(ebx.add(0xe) as *const i16) {
+                                0 => v as u32 + 0x1ac,
+                                1 => v as u32 + 0x1b2,
+                                2 => v as u32 + 0x1b8,
+                                _ => 0,
+                            }
+                        }
+                        0x0b => {
+                            vehicle_on_fire(ebx, 0xdbba0);
+                            let v = (angle + 0x20) >> 6 & 1;
+                            match *(ebx.add(0xe) as *const i16) {
+                                0 => v as u32 + 0x1ae,
+                                1 => v as u32 + 0x1b4,
+                                2 => v as u32 + 0x1ba,
+                                _ => 0,
+                            }
+                        }
+                        0x0c => {
+                            animate_model(ebx);
+                            let v = (angle + 0x20) >> 6 & 1;
+                            match *(ebx.add(0xe) as *const i16) {
+                                0 => v as u32 + 0x1b0,
+                                1 => v as u32 + 0x1b6,
+                                2 => v as u32 + 0x1bc,
+                                _ => 0,
+                            }
+                        }
+                        0x0d | 0x0e => {
+                            vehicle_moving(ebx, 0xf);
+                            ((angle + 0x10) >> 5 & 7) as u32 + 0x1be
+                        }
+                        0x0f => {
+                            vehicle_on_fire(ebx, 0x2328);
+                            ((angle + 0x20) >> 6 & 3) as u32 + 0x1c6
+                        }
+                        0x10 => {
+                            ((angle + 0x20) >> 6 & 3) as u32 + 0x1ca
+                        }
+                        0x11 | 0x12 => {
+                            vehicle_moving(ebx, 0x13);
+                            ((angle + 0x10) >> 5 & 7) as u32 + 0x206
+                        }
+                        0x13 => {
+                            vehicle_on_fire(ebx, 0xafc8);
+                            ((angle + 0x20) >> 6 & 3) as u32 + 0x20e
+                        }
+                        0x14 => {
+                            animate_model(ebx);
+                            ((angle + 0x20) >> 6 & 3) as u32 + 0x212
+                        }
+                        0x15..=0x1b => 0,
+                        0x1c | 0x1d => {
+                            vehicle_moving(ebx, 0x1e);
+                            ((angle + 0x10) >> 5 & 7) as u32 + 0x216
+                        }
+                        0x1e => {
+                            vehicle_on_fire(ebx, 0xc350);
+                            ((angle + 0x20) >> 6 & 3) as u32 + 0x21e
+                        }
+                        0x1f => {
+                            ((angle + 0x20) >> 6 & 3) as u32 + 0x222
+                        }
+                        0x20..=0x23 => 0,
+                        0x24 | 0x25 => {
+                            vehicle_moving(ebx, 0x26);
+                            ((angle + 0x10) >> 5 & 7) as u32 + 0x1d6
+                        }
+                        0x26 => {
+                            vehicle_on_fire(ebx, 0x9c40);
+                            ((angle + 0x20) >> 6 & 3) as u32 + 0x1de
+                        }
+                        0x27 => {
+                            animate_model(ebx);
+                            ((angle + 0x20) >> 6 & 3) as u32 + 0x1e2
+                        }
+                        0x28 | 0x29 => {
+                            vehicle_moving(ebx, 0x2a);
+                            ((angle + 0x10) >> 5 & 7) as u32 + 0x1ee
+                        }
+                        0x2a => {
+                            vehicle_on_fire(ebx, 0x88b8);
+                            ((angle + 0x20) >> 6 & 3) as u32 + 0x1f6
+                        }
+                        0x2b => {
+                            animate_model(ebx);
+                            ((angle + 0x20) >> 6 & 3) as u32 + 0x1fa
+                        }
+                        _ => 0,
+                    }
+                } else {
+                    0
+                };
+
+                // Update animation frame if it changed (field_0x12 = frame id,
+                // field_0x10 = STARTS_ANI[frame id]).
+                let cur_frame = *(ebx.add(0x12) as *const u16) as u32;
+                if esi != cur_frame && esi != 0 {
+                    let starts_ani = STARTS_ANI as *const u16;
+                    *(ebx.add(0x10) as *mut u16) = *starts_ani.add(esi as usize);
+                    *(ebx.add(0x12) as *mut u16) = esi as u16;
+                }
+            }
+
+            ebx = ebx.add(0x2a);
+            if ebx >= LAST_VEHICLE {
                 break;
             }
         }

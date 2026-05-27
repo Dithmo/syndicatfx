@@ -26,6 +26,8 @@ extern "C" {
     fn get_angle(dx: i32, dy: i32) -> u8;
     fn drop_all_weapons(entity: *mut u8);
     fn kill_all_weapons(entity: *mut u8);
+    fn agent_check_arc_for_enemy(entity: *mut u8, perception: i32, intelligence: i32) -> *mut u8;
+    fn person_use_weapon(entity: *mut u8, tx: i32, ty: i32, tz: i32);
 }
 
 // ---------------------------------------------------------------------------
@@ -1761,5 +1763,170 @@ pub fn fn_s_person_dead_on_fire(entity: *mut u8) {
         let cx = *(eax.add(0x0a) as *const u16) | 0x108;
         *(eax.add(0x0a) as *mut u16) = cx as u16;
         animate_model(eax);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x33120  fn_S_PERSON_GUARD_AREA
+//
+// Intelligence-based enemy detection + weapon use. Gets weapon range from
+// DATA_5A6C2[weapon_type], scales by perception via get_person_perception,
+// calls agent_check_arc_for_enemy. If an enemy is found, fires via
+// person_use_weapon. Decrements guard timer (field_0x42), triggers
+// new_state_person when timer reaches 0, then affect_person.
+//
+// Literal translation of 0x33120–0x33852.
+// ---------------------------------------------------------------------------
+pub fn fn_s_person_guard_area(entity: *mut u8) {
+    use crate::syndre::data::{LEVEL_THINGS_BASE, DATA_5A6C2, DATA_5E12E};
+    use crate::syndre::funcs_20000::animate_model;
+    unsafe {
+        let ebx = entity;
+        *ebx.add(0x54) = 0;
+
+        let edi = get_person_intelligence(ebx, 100) as i32;
+        let dx = *(ebx.add(0x44) as *const u16);
+        *ebx.add(0x46) = 0;
+
+        if dx != 0 {
+            let esi = LEVEL_THINGS_BASE.add(dx as usize); // held weapon
+
+            if *(esi.add(0x14) as *const i16) < 0 {
+                // Weapon out of ammo — pick a new one
+                let ax = choose_best_weapon(ebx, 0);
+                let cur = *(ebx.add(0x44) as *const u16);
+                if ax == cur {
+                    new_state_person(ebx); // no usable weapon
+                } else {
+                    *(ebx.add(0x44) as *mut u16) = ax;
+                }
+            }
+
+            // Compute weapon detection range: DATA_5A6C2[weapon_type] abs >> 8
+            let wtype = *esi.add(0x19) as usize;
+            let raw_range = if wtype < DATA_5A6C2.len() { DATA_5A6C2[wtype] as i32 } else { 0 };
+            // Compute abs(raw_range) >> 8 faithfully (signed sar, sub)
+            let range_sig = raw_range as i32;
+            let range_abs_shr8 = (range_sig.unsigned_abs() as i32) >> 8;
+            let perception_range = get_person_perception(ebx, range_abs_shr8);
+            DATA_5E12E = (perception_range << 8) as i16;
+
+            let enemy = agent_check_arc_for_enemy(ebx, DATA_5E12E as i32, edi);
+            if !enemy.is_null() {
+                let tz = (*(enemy.add(0x8) as *const i16) as i32).wrapping_add(0x80);
+                let ty = *(enemy.add(0x6) as *const i16) as i32;
+                let tx = *(enemy.add(0x4) as *const i16) as i32;
+                person_use_weapon(ebx, tx, ty, tz);
+            }
+        }
+
+        animate_model(ebx);
+        let cx = *(ebx.add(0x42) as *const i16);
+        if cx == 0 {
+            new_state_person(ebx);
+        }
+        let si = cx.wrapping_sub(1);
+        *(ebx.add(0x42) as *mut i16) = si;
+        let new_state = affect_person(ebx) as u8;
+        *ebx.add(0x19) = new_state;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x33230  fn_S_PERSON_WANDER
+//
+// Random walk: compute displacement from sin/cos tables at speed 0x10,
+// update DATA_60B28/2A. On collision, call quick_decide_on_hug_direction.
+// Check tile under entity (via data_55358 map pointer): if tile 0x80
+// (water barrier going east) or 0x81 (going south), redirect angle and
+// set state 0x29 (WANDER_WAIT) with timer 100. Add random jitter ±1 to
+// angle, set "civilian" flag bit, animate and affect_person.
+//
+// Literal translation of 0x33230–0x33362.
+// ---------------------------------------------------------------------------
+pub fn fn_s_person_wander(entity: *mut u8) {
+    use crate::syndre::data::{DATA_55358, DATA_5AB60, DATA_5AD60, DATA_60B28, DATA_60B2A};
+    use crate::syndre::funcs_20000::animate_model;
+    unsafe {
+        let ebx = entity;
+        *ebx.add(0x54) = 0x10; // fixed walk speed
+
+        let cl = *ebx.add(0x1a) as usize; // angle index
+        let al = *ebx.add(0x54) as i32;   // speed = 16
+
+        // X displacement: sin * speed >> 8
+        let sin_val = *(DATA_5AB60.as_ptr().add(cl * 2) as *const i16) as i32;
+        let dx_disp = (sin_val.wrapping_mul(al)) >> 8;
+        DATA_60B28 = DATA_60B28.wrapping_add(dx_disp as i16);
+
+        // Y displacement: cos * speed >> 8
+        let cos_val = *(DATA_5AD60.as_ptr().add(cl * 2) as *const i16) as i32;
+        let dy_disp = (cos_val.wrapping_mul(al)) >> 8;
+        DATA_60B2A = DATA_60B2A.wrapping_add(dy_disp as i16);
+
+        if person_colide(ebx) != 0 {
+            quick_decide_on_hug_direction(ebx, 0xa);
+        }
+
+        // Compute tile x/y
+        let ey_raw = *(ebx.add(0x6) as *const i16) as i32;
+        let ex_raw = *(ebx.add(0x4) as *const i16) as i32;
+        let ez_raw = *(ebx.add(0x8) as *const i16) as i32;
+
+        // tile_y = signed_remainder(ey, 0x6000) >> 8
+        let rem_y = ey_raw % 0x6000;
+        let tile_y = if rem_y < 0 {
+            let r = rem_y + 0x6000;
+            ((r as i32) - ((r as i32 >> 0x1f) << 8)) >> 8
+        } else {
+            ((rem_y as i32) - ((rem_y as i32 >> 0x1f) << 8)) >> 8
+        };
+
+        // tile_x = ((ex_raw & 0xff00) as i32 - sign_ext*256) >> 8
+        let ex_masked = (ex_raw & 0xff00_i32) as i32;
+        let tile_x = (ex_masked - (ex_masked >> 31).wrapping_mul(256)) >> 8;
+
+        // Map cell pointer: data_55358 + (tile_y * 128 + tile_x) * 4 + z_level * 4
+        let map_ptr = DATA_55358;
+        if !map_ptr.is_null() {
+            let cell_idx = ((tile_y as usize).wrapping_mul(128))
+                .wrapping_add(tile_x as usize);
+            let cell_base = *(map_ptr.add(cell_idx * 4) as *const *mut u8);
+            if !cell_base.is_null() {
+                // z index: (entity.z - 1) >> 7
+                let z_idx = ((ez_raw.wrapping_sub(1)).unsigned_abs() as i32 >> 7) as usize;
+                let tile_byte = *cell_base.add(z_idx * 4); // each z level = 4 bytes apart? From asm: (%ecx) = first byte
+
+                if tile_byte == 0x80 {
+                    // Water/barrier heading east: if angle in [0x80, 0x100], redirect to 0xc0
+                    let dh = *ebx.add(0x1a) as u32;
+                    if dh >= 0x80 && dh <= 0xff {
+                        *ebx.add(0x1a) = 0xc0;
+                        *ebx.add(0x19) = 0x29;
+                        *(ebx.add(0x42) as *mut i16) = 0x64;
+                    }
+                } else if tile_byte == 0x81 {
+                    // Water/barrier heading north: if angle in [0x40, 0xc0], redirect to 0x80
+                    let ah = *ebx.add(0x1a);
+                    if ah >= 0x40 && ah <= 0xc0 {
+                        *ebx.add(0x1a) = 0x80;
+                        *ebx.add(0x19) = 0x29;
+                        *(ebx.add(0x42) as *mut i16) = 0x64;
+                    }
+                }
+            }
+        }
+
+        // Random angle jitter: ±1 (random(3) - 1)
+        let jitter = (random(3) - 1) as i8;
+        let cl_byte = (*ebx.add(0x1a) as i8).wrapping_add(jitter) as u8;
+        *ebx.add(0x1a) = cl_byte;
+
+        // Set "civilian visible" flag
+        *ebx.add(0x0b) |= 0x10;
+
+        animate_model(ebx);
+        let new_state = affect_person(ebx) as u8;
+        *ebx.add(0x19) = new_state;
     }
 }

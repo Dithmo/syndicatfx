@@ -97,6 +97,31 @@ pub static WEAPON_MAX_AMMO: [u16; 10] = [
     0x001d, // type 9: scanner     29
 ];
 
+// ---- Weapon detection range table (data at 0x5a6c2; u16 per weapon type) ---
+// Indexed as DATA_5A6C2[weapon_type]; values are fixed-point distances (>> 8).
+pub static DATA_5A6C2: [u16; 20] = [
+    0x0000, // type  0: none
+    0x0100, // type  1: pistol        256
+    0x0500, // type  2: shotgun      1280
+    0x1400, // type  3: uzi          5120
+    0x0400, // type  4: minigun      1024
+    0x0700, // type  5: laser        1792
+    0x0b00, // type  6: gauss        2816
+    0x1000, // type  7: flamer       4096
+    0x0200, // type  8: long-range    512
+    0x1800, // type  9: scanner      6144
+    0x1000, // type 10:              4096
+    0x0100, // type 11:               256
+    0x03e8, // type 12:              1000
+    0x0100, // type 13:               256
+    0x0100, // type 14:               256
+    0x0100, // type 15:               256
+    0x0100, // type 16:               256
+    0x0300, // type 17:               768
+    0x0300, // type 18:               768
+    0x0300, // type 19:               768
+];
+
 // ---- Player credits (EXPORT_SYMBOL(players)) ----------------------------
 pub static mut PLAYERS: [u32; 8] = [0u32; 8];
 pub static mut SELECTED_TEAM: [u8; 8] = [0u8; 8];
@@ -180,6 +205,7 @@ pub static mut THING_DRAWLIST: [u8; 16 * 1024] = [0u8; 16 * 1024];
 pub static mut DATA_5E122: u16 = 0;
 pub static mut DATA_5E124: u16 = 0;
 pub static mut DATA_5E128: i16 = 0; // z-displacement added to DATA_60B2C in hug moves
+pub static mut DATA_5E12E: i16 = 0; // perception range arg for agent_check_arc_for_enemy
 pub static mut DATA_5E110: u16 = 0;
 pub static mut DATA_5E112: u16 = 0;
 pub static mut DATA_5E11E: u16 = 0;

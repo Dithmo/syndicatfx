@@ -244,6 +244,7 @@ pub static mut LAST_OBJECT:  *mut u8 = std::ptr::null_mut(); // 0x60aec
 pub static mut DATA_60B28: i16 = 0; // x accumulator
 pub static mut DATA_60B2A: i16 = 0; // y accumulator
 pub static mut DATA_60B2C: i16 = 0; // z accumulator
+pub static mut DATA_60B30: i16 = 0; // ammo display cache (scanner/HUD)
 
 // ---- Country index (used in draw_panel / level_init) ------------------------
 pub static mut DATA_60B36: u16 = 0;

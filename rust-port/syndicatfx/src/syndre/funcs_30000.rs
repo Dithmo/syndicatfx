@@ -44,6 +44,12 @@ extern "C" {
     // move_vehicles helpers
     fn vehicle_moving(entity: *mut u8, arg: i32);
     fn vehicle_on_fire(entity: *mut u8, arg: i32);
+    // move_weapons helpers
+    fn create_ammo_effect(x: i32, y: i32, z: i32, angle: i32, z_angle: i32,
+                          range: i32, owner: i32, ty: i32) -> *mut u8;
+    fn play_distance_sample(entity: *mut u8, sound_id: i32);
+    fn affect_weapon(entity: *mut u8);
+    fn init_effect(x: i32, y: i32, z: i32) -> *mut u8;
 }
 
 // ---------------------------------------------------------------------------
@@ -3141,6 +3147,547 @@ pub fn move_vehicles_impl() {
             if ebx >= LAST_VEHICLE {
                 break;
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x3a970  move_weapons
+//
+// Per-frame weapon entity update loop (stride 0x24, LEVEL_WEAPONS..LEVEL_EFFECTS).
+//
+// Each active weapon:
+//   1. If it has an owner (field_0x20): move_mapwho to owner pos; copy owner
+//      angle/z_angle; if it is the owner's selected weapon (field_0x44) and
+//      field_0x14 >= 0: set state_flag=1 (selected, not in danger) or
+//      state_flag=2 + perception_adj (selected, owner in danger → fire).
+//   2. Dispatch on field_0x19 (weapon type, 0x00-0x13) to handle shooting,
+//      animation, ammo, etc.
+//   3. Epilogue: if frame_id changed (and != 0), update field_0x10/0x12.
+//
+// Local stack variables (named in assembly):
+//   weapon_offset : (edi - LEVEL_THINGS_BASE) as u16  — updated each iter
+//   frame_id      : i16  — 0x10(%esp_frame); animation frame set by animate
+//   state_flag    : i16  — 0x14(%esp_frame); 0=idle, 1=selected, 2=firing
+//   perception_adj: i16  — 0x08(%esp_frame); 0xf - get_person_perception
+//   angle_offset  : i16  — 0x04(%esp_frame); per-shot random angle spread
+//   flamer_ctr    : i32  — 0x0c(%esp_frame); loop counter for flamer pellets
+// ---------------------------------------------------------------------------
+pub fn move_weapons_impl() {
+    use crate::syndre::funcs_20000::{animate_model, move_mapwho,
+                                     goto_angle, affect_by_wind, remove_model};
+    unsafe {
+        let mut edi = LEVEL_WEAPONS;
+        if edi.is_null() || edi >= LEVEL_EFFECTS { return; }
+        let mut weapon_offset =
+            (edi as usize).wrapping_sub(LEVEL_THINGS_BASE as usize) as u16;
+
+        loop {
+            if *edi.add(0x18) != 0 {
+                let mut frame_id:       i16 = 0;
+                let mut state_flag:     i16 = 0;
+                let mut perception_adj: i16 = 0;
+                let mut owner_ptr: *mut u8 = core::ptr::null_mut();
+
+                // ---- Owner check ----------------------------------------
+                let owner_ref = *(edi.add(0x20) as *const u16) as usize;
+                if owner_ref != 0 {
+                    let ebp = LEVEL_THINGS_BASE.add(owner_ref);
+                    owner_ptr = ebp;
+                    move_mapwho(edi,
+                        *(ebp.add(0x4) as *const i16),
+                        *(ebp.add(0x6) as *const i16),
+                        *(ebp.add(0x8) as *const i16));
+                    *edi.add(0x1a) = *ebp.add(0x1a);
+                    *edi.add(0x1b) = *ebp.add(0x1b);
+
+                    let selected = *(ebp.add(0x44) as *const u16) as usize;
+                    if weapon_offset as usize == selected {
+                        let wep14 = *(edi.add(0x14) as *const i16);
+                        if wep14 >= 0 {
+                            if *ebp.add(0x46) != 0 {
+                                // owner in danger → fire mode
+                                state_flag     = 2;
+                                perception_adj =
+                                    0xf - get_person_perception(ebp, 0xf) as i16;
+                            } else {
+                                state_flag = 1;
+                            }
+                        }
+                    }
+                }
+
+                // ---- Angle-offset helper (reused by several fire-mode states)
+                // angle_offset = if perception_adj != 0: random-centered, else 0
+                let compute_angle_offset = |pa: i16| -> i16 {
+                    if pa != 0 {
+                        let r = random(pa as i32) as i16;
+                        let half = ((pa as i32).abs() as i16).wrapping_shr(1);
+                        r.wrapping_sub(half)
+                    } else {
+                        0
+                    }
+                };
+
+                // ---- Range helper (DATA_5A6C2[wtype] / divisor & 0xff) ---
+                let weapon_type = *edi.add(0x19) as usize;
+
+                // ---- State dispatch (vtable_3a920, states 0x00-0x13) -----
+                match *edi.add(0x19) {
+                    // 0x00: no-op
+                    0x00 => {}
+
+                    // 0x01: pistol casing (state_flag=1 → spawn casing;
+                    //       state_flag=0 → animate frame 0x16f)
+                    0x01 => {
+                        if state_flag == 1 {
+                            create_ammo_effect(
+                                *(edi.add(0x4) as *const i16) as i32,
+                                *(edi.add(0x6) as *const i16) as i32,
+                                *(edi.add(0x8) as *const i16) as i32,
+                                0, 0, 0,
+                                *(edi.add(0x20) as *const u16) as i32,
+                                0x32);
+                        }
+                        if state_flag == 0 {
+                            frame_id = 0x16f;
+                            animate_model(edi);
+                        }
+                    }
+
+                    // 0x02: pistol bullet
+                    0x02 => {
+                        if state_flag >= 2 {
+                            play_distance_sample(edi, 2);
+                            let angle_offset = compute_angle_offset(perception_adj);
+                            let range =
+                                (DATA_5A6C2[weapon_type] as i32 / 128) & 0xff;
+                            create_ammo_effect(
+                                *(edi.add(0x4) as *const i16) as i32,
+                                *(edi.add(0x6) as *const i16) as i32,
+                                (*(edi.add(0x8) as *const i16) as i32)
+                                    .wrapping_add(0x80),
+                                ((*edi.add(0x1a) as i16)
+                                    .wrapping_add(angle_offset) & 0xff_i16) as i32,
+                                *edi.add(0x1b) as i32,
+                                range,
+                                *(edi.add(0x20) as *const u16) as i32,
+                                0x1d);
+                            let v = *(edi.add(0x14) as *const i16).wrapping_sub(1);
+                            *(edi.add(0x14) as *mut i16) = v;
+                        }
+                        if state_flag == 0 {
+                            frame_id = 0x170;
+                            animate_model(edi);
+                        }
+                    }
+
+                    // 0x03: shotgun
+                    0x03 => {
+                        if state_flag >= 2 {
+                            play_distance_sample(edi, 0x16);
+                            let range =
+                                (DATA_5A6C2[weapon_type] as i32 / 128) & 0xff;
+                            create_ammo_effect(
+                                *(edi.add(0x4) as *const i16) as i32,
+                                *(edi.add(0x6) as *const i16) as i32,
+                                (*(edi.add(0x8) as *const i16) as i32)
+                                    .wrapping_add(0x80),
+                                *edi.add(0x1a) as i32,
+                                *edi.add(0x1b) as i32,
+                                range,
+                                *(edi.add(0x20) as *const u16) as i32,
+                                0x1d);
+                            let v = *(edi.add(0x14) as *const i16) - 1;
+                            *(edi.add(0x14) as *mut i16) = v;
+                        }
+                        if state_flag == 0 {
+                            frame_id = 0x171;
+                            animate_model(edi);
+                        }
+                    }
+
+                    // 0x04: uzi burst (7 pellets, esi = -3..3)
+                    0x04 => {
+                        if state_flag >= 2 {
+                            play_distance_sample(edi, 1);
+                            let v0 = *(edi.add(0x14) as *const i16) - 1;
+                            *(edi.add(0x14) as *mut i16) = v0;
+                            let mut burst_idx: i32 = -3;
+                            loop {
+                                let angle_offset =
+                                    compute_angle_offset(perception_adj);
+                                let range = (DATA_5A6C2[weapon_type] as i32 / 128) & 0xff;
+                                // spread = abs_half(burst_idx)
+                                let abs_half = if burst_idx >= 0 {
+                                    burst_idx >> 1
+                                } else {
+                                    (burst_idx + 1) >> 1
+                                };
+                                let ang = (*edi.add(0x1a) as i32)
+                                    .wrapping_add(abs_half)
+                                    .wrapping_add(angle_offset as i32)
+                                    & 0xff;
+                                create_ammo_effect(
+                                    *(edi.add(0x4) as *const i16) as i32,
+                                    *(edi.add(0x6) as *const i16) as i32,
+                                    (*(edi.add(0x8) as *const i16) as i32)
+                                        .wrapping_add(0x80),
+                                    ang,
+                                    *edi.add(0x1b) as i32,
+                                    range,
+                                    *(edi.add(0x20) as *const u16) as i32,
+                                    0x1d);
+                                burst_idx += 1;
+                                if burst_idx > 3 { break; }
+                            }
+                        }
+                        if state_flag == 0 {
+                            frame_id = 0x172;
+                            animate_model(edi);
+                        }
+                    }
+
+                    // 0x05: minigun (single shot per tick)
+                    0x05 => {
+                        if state_flag >= 2 {
+                            play_distance_sample(edi, 0xb);
+                            let angle_offset = compute_angle_offset(perception_adj);
+                            let range = (DATA_5A6C2[weapon_type] as i32 / 128) & 0xff;
+                            create_ammo_effect(
+                                *(edi.add(0x4) as *const i16) as i32,
+                                *(edi.add(0x6) as *const i16) as i32,
+                                (*(edi.add(0x8) as *const i16) as i32)
+                                    .wrapping_add(0x80),
+                                ((*edi.add(0x1a) as i16)
+                                    .wrapping_add(angle_offset) & 0xff_i16) as i32,
+                                *edi.add(0x1b) as i32,
+                                range,
+                                *(edi.add(0x20) as *const u16) as i32,
+                                0x1d);
+                            let v = *(edi.add(0x14) as *const i16) - 1;
+                            *(edi.add(0x14) as *mut i16) = v;
+                        }
+                        if state_flag == 0 {
+                            frame_id = 0x173;
+                            animate_model(edi);
+                        }
+                    }
+
+                    // 0x06: laser (5 pulses per tick)
+                    0x06 => {
+                        if state_flag >= 2 {
+                            play_distance_sample(edi, 0xd);
+                            let range = (DATA_5A6C2[weapon_type] as i32 / 128) & 0xff;
+                            let mut shot: i32 = 0;
+                            loop {
+                                let angle_offset =
+                                    compute_angle_offset(perception_adj);
+                                let ang = ((*edi.add(0x1a) as i16)
+                                    .wrapping_add(angle_offset) & 0xff_i16) as i32;
+                                create_ammo_effect(
+                                    *(edi.add(0x4) as *const i16) as i32,
+                                    *(edi.add(0x6) as *const i16) as i32,
+                                    (*(edi.add(0x8) as *const i16) as i32)
+                                        .wrapping_add(0x80),
+                                    ang,
+                                    *edi.add(0x1b) as i32,
+                                    range,
+                                    *(edi.add(0x20) as *const u16) as i32,
+                                    0x1d);
+                                let v = *(edi.add(0x14) as *const i16) - 1;
+                                *(edi.add(0x14) as *mut i16) = v;
+                                shot += 1;
+                                if shot >= 5 { break; }
+                            }
+                        }
+                        if state_flag == 0 {
+                            frame_id = 0x174;
+                            animate_model(edi);
+                        }
+                    }
+
+                    // 0x07: gauss/energy weapon (range / 64)
+                    0x07 => {
+                        if state_flag >= 2 {
+                            play_distance_sample(edi, 4);
+                            let angle_offset = compute_angle_offset(perception_adj);
+                            let range = (DATA_5A6C2[weapon_type] as i32 / 64) & 0xff;
+                            create_ammo_effect(
+                                *(edi.add(0x4) as *const i16) as i32,
+                                *(edi.add(0x6) as *const i16) as i32,
+                                (*(edi.add(0x8) as *const i16) as i32)
+                                    .wrapping_add(0x80),
+                                ((*edi.add(0x1a) as i16)
+                                    .wrapping_add(angle_offset) & 0xff_i16) as i32,
+                                *edi.add(0x1b) as i32,
+                                range,
+                                *(edi.add(0x20) as *const u16) as i32,
+                                0x26);
+                            let v = *(edi.add(0x14) as *const i16) - 1;
+                            *(edi.add(0x14) as *mut i16) = v;
+                        }
+                        if state_flag == 0 {
+                            frame_id = 0x175;
+                            animate_model(edi);
+                        }
+                    }
+
+                    // 0x08: flamer — creates 4 pellets, updates existing ones
+                    0x08 => {
+                        if state_flag >= 2 {
+                            play_distance_sample(edi, 5);
+                            let range = (DATA_5A6C2[weapon_type] as i32 / 0x26) & 0xff;
+                            let base_angle = *edi.add(0x1a) as u8;
+                            let dir_idx =
+                                ((base_angle as usize).wrapping_add(0x10)) & 0xe0;
+                            let cos_val = DATA_5AD60[dir_idx] as i32;
+                            let sin_val = DATA_5AB60[dir_idx] as i32;
+                            let off_y = cos_val * 5 * 32 >> 8;
+                            let off_x = sin_val * 5 * 32 >> 8;
+                            let wx = *(edi.add(0x4) as *const i16) as i32;
+                            let wy = *(edi.add(0x6) as *const i16) as i32;
+                            let wz = (*(edi.add(0x8) as *const i16) as i32)
+                                .wrapping_add(0x6c);
+
+                            let mut flamer_ctr: i32 = 0;
+                            loop {
+                                let pellet = create_ammo_effect(
+                                    (wx + off_x) as i32,
+                                    (wy + off_y) as i32,
+                                    wz,
+                                    base_angle as i32,
+                                    0,
+                                    range,
+                                    *(edi.add(0x20) as *const u16) as i32,
+                                    0x20);
+                                if !pellet.is_null() {
+                                    // Save pellet position to accumulators
+                                    DATA_60B28 = *(pellet.add(0x4) as *const i16);
+                                    DATA_60B2A = *(pellet.add(0x6) as *const i16);
+                                    DATA_60B2C = *(pellet.add(0x8) as *const i16);
+                                    // Update existing pellets
+                                    let mut inner: i32 = 0;
+                                    while inner < flamer_ctr {
+                                        let v14 =
+                                            *(pellet.add(0x14) as *const i16) - 1;
+                                        *(pellet.add(0x14) as *mut i16) = v14;
+                                        let ang_rand = (random(0xb) as i32)
+                                            .wrapping_add(0x26) as u16 as u32;
+                                        goto_angle(
+                                            ang_rand as i16,
+                                            *pellet.add(0x1a));
+                                        affect_by_wind();
+                                        if random(3) == 0 {
+                                            animate_model(pellet);
+                                        }
+                                        inner += 1;
+                                    }
+                                    move_mapwho(pellet,
+                                        DATA_60B28, DATA_60B2A, DATA_60B2C);
+                                }
+                                let v = *(edi.add(0x14) as *const i16) - 1;
+                                *(edi.add(0x14) as *mut i16) = v;
+                                flamer_ctr += 1;
+                                if flamer_ctr >= 4 { break; }
+                            }
+                        }
+                        if state_flag == 0 {
+                            frame_id = 0x176;
+                            animate_model(edi);
+                        }
+                    }
+
+                    // 0x09: long-range sniper
+                    0x09 => {
+                        if state_flag >= 2 {
+                            play_distance_sample(edi, 0xc);
+                            let angle_offset = compute_angle_offset(perception_adj);
+                            let range = (DATA_5A6C2[weapon_type] as i32 / 128) & 0xff;
+                            create_ammo_effect(
+                                *(edi.add(0x4) as *const i16) as i32,
+                                *(edi.add(0x6) as *const i16) as i32,
+                                (*(edi.add(0x8) as *const i16) as i32)
+                                    .wrapping_add(0x80),
+                                ((*edi.add(0x1a) as i16)
+                                    .wrapping_add(angle_offset) & 0xff_i16) as i32,
+                                *edi.add(0x1b) as i32,
+                                range,
+                                *(edi.add(0x20) as *const u16) as i32,
+                                0x1d);
+                            let v = *(edi.add(0x14) as *const i16) - 1;
+                            *(edi.add(0x14) as *mut i16) = v;
+                        }
+                        if state_flag == 0 {
+                            frame_id = 0x177;
+                            animate_model(edi);
+                        }
+                    }
+
+                    // 0x0a: scanner — animate if idle; multiplayer ammo sync
+                    0x0a => {
+                        if state_flag == 0 {
+                            frame_id = 0x178;
+                            animate_model(edi);
+                        }
+                        if IS_MULTIPLAYER_GAME != 0 {
+                            let ebp2 = LEVEL_THINGS_BASE
+                                .add(*(edi.add(0x20) as *const u16) as usize);
+                            let person_offset = (ebp2 as usize)
+                                .wrapping_sub(LEVEL_PEOPLE as usize) as i32;
+                            // team_idx = person_offset / 0x5c / 8, rounded toward 0
+                            let per_ent = person_offset / 0x5c;
+                            let team_idx = if per_ent >= 0 {
+                                per_ent >> 3
+                            } else {
+                                (per_ent + 7) >> 3
+                            };
+                            if state_flag == 1 {
+                                if team_idx as i32 == NETWORK_SLOT as i32 {
+                                    let ammo = *(edi.add(0x14) as *const i16);
+                                    DATA_60B30 = ammo;
+                                    // ammo * 5/4
+                                    let adj = (ammo as i32
+                                        + (ammo as i32 / 4)) as i16;
+                                    DATA_60B30 = adj;
+                                }
+                                let v = *(edi.add(0x14) as *const i16) - 1;
+                                *(edi.add(0x14) as *mut i16) = v;
+                            }
+                            if *edi.add(0x22) == 0 {
+                                let wtype = *edi.add(0x19) as usize;
+                                let max = WEAPON_MAX_AMMO[wtype] as i16;
+                                let cur = *(edi.add(0x14) as *const i16);
+                                if cur < max {
+                                    *(edi.add(0x14) as *mut i16) = cur + 1;
+                                }
+                            }
+                        }
+                    }
+
+                    // 0x0b: medkit-on-person (top up person's field_0x14)
+                    0x0b => {
+                        if state_flag == 1 && !owner_ptr.is_null() {
+                            let op14 = *(owner_ptr.add(0x14) as *const i16);
+                            if op14 < 0x10
+                                && (*(owner_ptr.add(0xb)) & 0x1) == 0
+                            {
+                                *(owner_ptr.add(0x14) as *mut i16) = 0x10;
+                                let cur = *(edi.add(0x14) as *const i16);
+                                *(edi.add(0x14) as *mut i16) = cur - 1;
+                            }
+                        }
+                        if state_flag == 0 {
+                            frame_id = 0x179;
+                            animate_model(edi);
+                        }
+                    }
+
+                    // 0x0c: grenade / time-bomb in flight
+                    0x0c => {
+                        if *(edi.add(0x1e) as *const i16) != 0 {
+                            // refill ammo (weapon being picked up again)
+                            let wtype = *edi.add(0x19) as usize;
+                            *(edi.add(0x0c) as *mut u16) = 0;
+                            *(edi.add(0x14) as *mut i16) =
+                                WEAPON_MAX_AMMO[wtype] as i16;
+                        } else {
+                            frame_id = 0x17a;
+                            animate_model(edi);
+                            affect_weapon(edi);
+                            let fuel = *(edi.add(0x14) as *const i16) - 1;
+                            *(edi.add(0x14) as *mut i16) = fuel;
+                            if fuel < 0 {
+                                // Explode
+                                let ex = *(edi.add(0x4) as *const i16) as i32;
+                                let ey = *(edi.add(0x6) as *const i16) as i32;
+                                let ez = *(edi.add(0x8) as *const i16) as i32;
+                                let eff = init_effect(ex, ey, ez);
+                                if !eff.is_null() {
+                                    *eff.add(0x19) = 0x34;
+                                    *eff.add(0x1a) = 0;
+                                    let bh = *eff.add(0xa) | 0x1;
+                                    *(eff.add(0x1c) as *mut u16) =
+                                        *(edi.add(0x20) as *const u16);
+                                    *eff.add(0xa) = bh;
+                                }
+                                remove_model(edi);
+                            }
+                        }
+                    }
+
+                    // 0x0d: animate only, frame 0x17b
+                    0x0d => {
+                        if state_flag == 0 {
+                            frame_id = 0x17b;
+                            animate_model(edi);
+                        }
+                    }
+
+                    // 0x0e: animate, frame 0x2ea
+                    0x0e => {
+                        if state_flag == 0 {
+                            frame_id = 0x2ea;
+                            animate_model(edi);
+                        }
+                    }
+
+                    // 0x0f: animate, frame 0x2ea (same handler as 0x0e)
+                    0x0f => {
+                        if state_flag == 0 {
+                            frame_id = 0x2ea;
+                            animate_model(edi);
+                        }
+                    }
+
+                    // 0x10: animate, frame 0x17c
+                    0x10 => {
+                        if state_flag == 0 {
+                            frame_id = 0x17c;
+                            animate_model(edi);
+                        }
+                    }
+
+                    // 0x11-0x13: on-ground weapon slow ammo regen
+                    0x11 | 0x12 | 0x13 => {
+                        if state_flag != 0 {
+                            let cur = *(edi.add(0x14) as *const i16);
+                            if cur >= 0 {
+                                *(edi.add(0x14) as *mut i16) = cur - 1;
+                            }
+                        }
+                        if state_flag == 0 {
+                            frame_id = 0x17d;
+                            animate_model(edi);
+                        }
+                        if *edi.add(0x22) == 0 {
+                            let wtype = *edi.add(0x19) as usize;
+                            let max = WEAPON_MAX_AMMO[wtype] as i32;
+                            let cur = *(edi.add(0x14) as *const i16) as i32;
+                            if cur < max {
+                                *(edi.add(0x14) as *mut i16) = (cur + 1) as i16;
+                            }
+                        }
+                        // cycle field_0x22: (val + 1) & 3
+                        *edi.add(0x22) = (*edi.add(0x22)).wrapping_add(1) & 3;
+                    }
+
+                    _ => {}
+                }
+
+                // ---- Animation-frame epilogue ----------------------------
+                let cur_frame = *(edi.add(0x12) as *const i16);
+                if frame_id != cur_frame && frame_id != 0 {
+                    let starts_ani = STARTS_ANI as *const u16;
+                    *(edi.add(0x10) as *mut u16) =
+                        *starts_ani.add(frame_id as usize);
+                    *(edi.add(0x12) as *mut i16) = frame_id;
+                }
+            }
+
+            weapon_offset = weapon_offset.wrapping_add(0x24);
+            edi = edi.add(0x24);
+            if edi >= LEVEL_EFFECTS { break; }
         }
     }
 }

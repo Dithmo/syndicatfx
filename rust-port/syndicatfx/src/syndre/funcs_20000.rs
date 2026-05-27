@@ -32,7 +32,16 @@ extern "C" {
     fn ac_LbDataLoadAll(files: *mut u8) -> i32;
     fn ac_sound_bank_setup();
     fn init_hires_blocks();
-    fn init_level_data();
+    fn init_map_data(map_buf: *mut u8);
+    fn ac_LbSpriteSetup(sprites: *mut u8, sprites_end: *mut u8, data: *mut u8);
+    fn init_computer_players();
+    fn adjust_vehicles();
+    fn ac_AppScreenSetup(mode: u32);
+    fn ac_LbScreenClear(colour: u32);
+    fn ac_sprintf(buf: *mut u8, fmt: *const u8, ...) -> i32;
+    fn LbScreenSurfaceClear(screen: *mut u8, colour: u32);
+    fn ac_LbPaletteSet(screen: *mut u8);
+    fn ac_ClearBFSampleStatus();
     fn GetTeamMemberName() -> u8;
     fn DoResearch() -> u8;
     fn CompleteResearch();
@@ -973,6 +982,81 @@ pub fn move_mapwho(entity: *mut u8, mut new_x: i16, mut new_y: i16, new_z: i16) 
         *(entity.add(4) as *mut i16) = new_x;
         *(entity.add(6) as *mut i16) = new_y;
         *(entity.add(8) as *mut i16) = new_z;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x25110  init_level_data
+//
+// Full level initialisation: sets up sprite tables, map, palette, screen,
+// sound status, wind state, and entity-array boundaries. Called at the end
+// of load_map_level for every mode. Delegates screen/sound details to externs.
+//
+// Literal translation: sprintf for palette filename replaced with Rust format;
+// DATA_5AB60[16]/DATA_5AD60[16] wind init preserved verbatim (shl 4, sar 8).
+// ---------------------------------------------------------------------------
+pub fn init_level_data() {
+    use crate::syndre::data::{DATA_5AB60, DATA_5AD60, LEVEL_PALETTES};
+    use bflibrary::screen::LB_DISPLAY;
+    unsafe {
+        init_map_data(MAP_BUF);
+        ac_LbSpriteSetup(H_SPRITES as *mut u8, H_SPRITES_END as *mut u8, H_SPRITES_DATA);
+        ac_LbSpriteSetup(DATA_5531C, DATA_55320, DATA_55334);
+        DATA_60AC8 = 0;
+        if IS_MULTIPLAYER_GAME == 0 { init_computer_players(); }
+        adjust_vehicles();
+        ac_AppScreenSetup(0x12);
+        ac_LbScreenClear(0);
+
+        // Build palette filename into a stack buffer.
+        // Multiplayer always uses H_PAL01; singleplayer uses the palette table.
+        let mut fname_buf = [0u8; 32];
+        if IS_MULTIPLAYER_GAME != 0 {
+            let src = b"DATA/H_PAL01.DAT\0";
+            fname_buf[..src.len()].copy_from_slice(src);
+        } else {
+            let pal_idx = LEVEL_PALETTES[CURRENT_LEVNO as usize] as u32;
+            let tens = (pal_idx / 10) as u8 + b'0';
+            let units = (pal_idx % 10) as u8 + b'0';
+            let src = b"DATA/H_PAL";
+            fname_buf[..src.len()].copy_from_slice(src);
+            fname_buf[src.len()]     = tens;
+            fname_buf[src.len() + 1] = units;
+            let ext = b".DAT\0";
+            fname_buf[src.len() + 2..src.len() + 2 + ext.len()].copy_from_slice(ext);
+        }
+        LbFileReadRNC(fname_buf.as_ptr(), GRAPHICS_PALETTE as *mut u16);
+        LbScreenSurfaceClear(WSCREEN, 0);
+        ac_LbPaletteSet(WSCREEN);
+
+        // Set mouse sprite to second entry (byte offset 6 = one 6-byte TbSprite)
+        if !POINTER_SPRITES.is_null() {
+            MOUSE_SPRITE = (POINTER_SPRITES as *mut u8).add(6) as *mut bflibrary::TbSprite;
+        }
+
+        LB_DISPLAY.left_button  = 0;
+        LB_DISPLAY.right_button = 0;
+        DATA_60B50 = 0;
+
+        set_structure_ends();
+        ac_ClearBFSampleStatus();
+
+        // Wind state initialisation (literal register assignments)
+        DATA_9BC77 = 0x10;
+        DATA_9BC76 = 0x14;
+        DATA_9BC79 = 0x01;
+        DATA_9BC78 = 0x10;
+        DATA_9BC74 = 0x0d48;
+        let bx = LEVEL_LOBOUNDARYY;
+        // level__Worlds = DATA_5AB60[16] * 16 >> 8 (signed shift)
+        let eax = (DATA_5AB60[16] as i32) << 4;
+        LEVEL_WORLDS = (eax >> 8) as i16;
+        DATA_9BC7A = 0x28;
+        DATA_9BC7B = 0x0a;
+        // DATA_9BC72 = DATA_5AD60[16] * 16 >> 8
+        let eax = (DATA_5AD60[16] as i32) << 4;
+        DATA_9BC72 = (eax >> 8) as i16;
+        if bx < 0x12 { LEVEL_LOBOUNDARYY = 0x12; }
     }
 }
 

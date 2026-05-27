@@ -70,16 +70,18 @@ pub static mut DATA_5E4AD: [u8;  8] = [0u8;  8]; // flag
 pub static mut DATA_5E4BF: [u8;  8] = [0u8;  8]; // flag2
 
 // Entity count / type per slot (player → agent mapping into level__People)
-pub static mut DATA_5E551: [u8;  512] = [0u8;  512]; // agent count for slot
-pub static mut DATA_5E552: [i8;  512] = [0i8;  512]; // signed flag
+// These are fields within a per-slot struct of stride 1047 bytes; index = slot * 1047.
+// 8 slots × 1047 = 8376 bytes needed; use 8192 + padding → 8448 total.
+pub static mut DATA_5E551: [u8;  8448] = [0u8;  8448]; // start agent index for slot
+pub static mut DATA_5E552: [i8;  8448] = [0i8;  8448]; // signed adjustment
 
-// Agent name / team data
-pub static mut DATA_5E555: [u8;  512] = [0u8;  512];
-pub static mut DATA_5E587: [u8;  512] = [0u8;  512];
-pub static mut DATA_5E5B9: [u8;  256] = [0u8;  256]; // name id
-pub static mut DATA_5E5BA: [u16; 256] = [0u16; 256]; // agent flags
-pub static mut DATA_5E5BC: [u16; 256] = [0u16; 256]; // gender
-pub static mut DATA_5E5C0: [u8;  256] = [0u8;  256]; // team assignment
+// Agent name / team data (same stride; fields at varying offsets within per-slot struct)
+pub static mut DATA_5E555: [u8;  8448] = [0u8;  8448];
+pub static mut DATA_5E587: [u8;  8448] = [0u8;  8448];
+pub static mut DATA_5E5B9: [u8;  8448] = [0u8;  8448]; // name id
+pub static mut DATA_5E5BA: [u8;  8448] = [0u8;  8448]; // agent flags (u16 via raw ptr)
+pub static mut DATA_5E5BC: [u8;  8448] = [0u8;  8448]; // gender (u16 via raw ptr)
+pub static mut DATA_5E5C0: [u8;  8448] = [0u8;  8448]; // team assignment
 
 // ---- Player credits (EXPORT_SYMBOL(players)) ----------------------------
 pub static mut PLAYERS: [u32; 8] = [0u32; 8];

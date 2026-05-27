@@ -195,9 +195,10 @@ pub fn set_default_player() {
 
                 // Base index into per-slot agent arrays
                 let base = si * 0x5c + agent_idx as usize;
-                if base < 512 {
-                    DATA_5E5BC[base] = (rand_val & 1) as u16;
-                    DATA_5E5BA[base] = 0x10;
+                if base < 8448 {
+                    // DATA_5E5BC/BA are now [u8] arrays (u16 fields stored via raw ptr)
+                    *(DATA_5E5BC.as_mut_ptr().add(base) as *mut u16) = (rand_val & 1) as u16;
+                    *(DATA_5E5BA.as_mut_ptr().add(base) as *mut u16) = 0x10u16;
                     DATA_5E5B9[base] = GetTeamMemberName();
                 }
 
@@ -207,9 +208,9 @@ pub fn set_default_player() {
             // Agents 18-50: mark as unused (flags = 0xFFFF, name = 0xFF)
             for extra in 0x12usize..0x32usize {
                 let base = si * 0x5c + extra;
-                if base < 512 {
-                    DATA_5E5BA[base] = 0xffff;
-                    DATA_5E5BC[base] = 0;
+                if base < 8448 {
+                    *(DATA_5E5BA.as_mut_ptr().add(base) as *mut u16) = 0xffffu16;
+                    *(DATA_5E5BC.as_mut_ptr().add(base) as *mut u16) = 0u16;
                     DATA_5E5B9[base] = 0xff;
                 }
             }

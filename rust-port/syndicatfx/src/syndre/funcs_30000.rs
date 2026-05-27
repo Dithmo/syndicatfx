@@ -14,6 +14,10 @@ extern "C" {
     fn ac_abs(x: i32) -> i32;
     fn can_i_persuad_you(entity: *mut u8, target: *mut u8) -> u16;
     fn i_cant_walk_in_this_direction(entity: *mut u8, direction: u32) -> u16;
+    fn person_goto_in_vehicle(entity: *mut u8, vehicle: *mut u8);
+    fn person_goto(entity: *mut u8);
+    fn person_colide(entity: *mut u8) -> u16;
+    fn decide_on_hug_direction(entity: *mut u8, speed: u32);
 }
 
 // ---------------------------------------------------------------------------
@@ -524,6 +528,131 @@ pub fn fn_s_person_next_command(entity: *mut u8) {
             *(entity.add(0x26) as *mut u16) = next_link;
         } else {
             *(entity.add(0x26) as *mut u16) = *(entity.add(0x28) as *const u16);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x32130  fn_S_PERSON_GOTO_POINT
+//
+// Walk-to-point state handler. If the agent is riding a vehicle (field_0x24
+// != 0 and vehicle field_0x18 == 2), delegates to person_goto_in_vehicle
+// and then calls move_mapwho with the data_60b28/2a/2c displacement.
+// Otherwise: person_goto, collision check, optional decide_on_hug_direction
+// if blocked, then affect_person and animate_model.
+//
+// Literal: reproduces the vehicle branch and the normal walk branch.
+// ---------------------------------------------------------------------------
+pub fn fn_s_person_goto_point(entity: *mut u8) {
+    use crate::syndre::data::{LEVEL_THINGS_BASE, DATA_60B28, DATA_60B2A, DATA_60B2C};
+    use crate::syndre::funcs_20000::{move_mapwho, animate_model};
+    unsafe {
+        let vehicle_link = *(entity.add(0x24) as *const u16);
+        if vehicle_link != 0 {
+            let vehicle = LEVEL_THINGS_BASE.add(vehicle_link as usize);
+            if *vehicle.add(0x18) == 2 {
+                person_goto_in_vehicle(entity, vehicle);
+                move_mapwho(entity,
+                    DATA_60B28 as i16, DATA_60B2A as i16, DATA_60B2C as i16);
+                return;
+            }
+        }
+        // Normal walk
+        person_goto(entity);
+        if person_colide(entity) != 0 {
+            decide_on_hug_direction(entity, 0x1f4);
+        }
+        let new_state = affect_person(entity) as u8;
+        *entity.add(0x19) = new_state;
+        animate_model(entity);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x315e0  who_shot_me
+//
+// Called when entity (victim) is hit; updates kill-event counters and sets
+// aggro bits on the attacker.  victim.field_0x16 holds the attacker's word
+// offset from LEVEL_THINGS_BASE.
+//
+// Counter semantics (which player's agents shot whom):
+//   DATA_60AF4: our agent shot a player-controlled person (bit 0x1)
+//   DATA_60AF5: our agent shot a person with bit 0x4
+//   DATA_60AF6: our agent shot a person with bit 0x8
+//   DATA_60AF7: our agent shot a person with bit 0x10 (civilian)
+//   DATA_60AF8: our agent shot an enemy person (bit 0x2, outside our range)
+//   DATA_60AFA: our agent shot one of our own agents (bit 0x2, inside range)
+//
+// Local-player range: DATA_5E551[slot*1047] gives the starting agent index N
+// in LEVEL_PEOPLE; range is [People+N*0x5c, People+(N+4)*0x5c).
+//
+// Aggro: if attacker is player/enemy/civilian (bits 0x1/0x2/0x10), set
+// attacker.field_0x1d |= 0x2 (when victim has 0x4 and attacker doesn't),
+// else attacker.field_0x1c |= 0x40.
+//
+// Literal translation of 0x315e0–0x316c7.
+// ---------------------------------------------------------------------------
+pub fn who_shot_me(victim: *mut u8) {
+    use crate::globals::NETWORK_SLOT;
+    use crate::syndre::data::{LEVEL_THINGS_BASE, LEVEL_PEOPLE, DATA_5E551,
+                               DATA_60AF4, DATA_60AF5, DATA_60AF6, DATA_60AF7,
+                               DATA_60AF8, DATA_60AFA};
+    unsafe {
+        let attacker_word = *(victim.add(0x16) as *const u16);
+        if attacker_word == 0 { return; }
+
+        // Compute slot * 1047 byte-offset into per-slot struct arrays
+        let ecx = NETWORK_SLOT as i32;  // signed extend
+        let mut eax = ecx;
+        eax <<= 5;           // eax = slot * 32
+        eax += ecx;          // eax = slot * 33
+        eax *= 4;            // eax = slot * 132
+        eax -= ecx;          // eax = slot * 131
+        eax *= 8;            // eax = slot * 1048
+        eax -= ecx;          // eax = slot * 1047
+        let slot_idx = eax as usize;
+
+        // Starting agent index for our slot, then compute people range
+        let start_n = DATA_5E551[slot_idx] as usize;
+        let player_start = LEVEL_PEOPLE.add(start_n.wrapping_mul(0x5c));
+        let player_end   = LEVEL_PEOPLE.add((start_n.wrapping_add(4)).wrapping_mul(0x5c));
+
+        // Attacker pointer
+        let edx = LEVEL_THINGS_BASE.add(attacker_word as usize);
+
+        // Is the attacker one of our 4 agents?
+        if edx >= player_start && edx < player_end {
+            // Yes — update kill counter based on victim type
+            if (*victim.add(0x1c) & 0x1) != 0 {
+                DATA_60AF4 = DATA_60AF4.wrapping_add(1);
+            } else if (*victim.add(0x1c) & 0x2) != 0 {
+                // Is the victim also one of our agents?
+                if victim >= player_start && victim < player_end {
+                    DATA_60AFA = DATA_60AFA.wrapping_add(1);
+                } else {
+                    DATA_60AF8 = DATA_60AF8.wrapping_add(1);
+                }
+            } else {
+                // Read victim field_0x1c into ah-position (byte)
+                let ah = *victim.add(0x1c);
+                if (ah & 0x10) != 0 {
+                    DATA_60AF7 = DATA_60AF7.wrapping_add(1);
+                } else if (ah & 0x4) != 0 {
+                    DATA_60AF5 = DATA_60AF5.wrapping_add(1);
+                } else if (ah & 0x8) != 0 {
+                    DATA_60AF6 = DATA_60AF6.wrapping_add(1);
+                }
+            }
+        }
+
+        // Aggro: if attacker is a player/enemy/civilian, mark it hostile
+        let cl = *edx.add(0x1c);
+        if (cl & 0x1) != 0 || (cl & 0x2) != 0 || (cl & 0x10) != 0 {
+            if (*victim.add(0x1c) & 0x4) != 0 && (*edx.add(0x1c) & 0x4) == 0 {
+                *edx.add(0x1d) |= 0x2;
+            } else {
+                *edx.add(0x1c) |= 0x40;
+            }
         }
     }
 }

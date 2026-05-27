@@ -33,12 +33,13 @@ extern "C" {
     fn CompleteResearch();
     fn process_panel_people(panel: *mut u8, active: u32, left: u32, right: u32) -> u16;
     fn process_panel(panel: *mut u8, active: u32, left: u32, right: u32) -> u16;
-    fn move_worlds();
     fn move_people();
     fn move_weapons();
     fn move_effects();
     fn move_objects();
     fn move_vehicles();
+    fn move_off_mapwho(entity: *mut u8);
+    fn ac_abs(val: i32) -> i32;
 }
 
 // ---- Data segment pointers used in this translation block -------------------
@@ -618,5 +619,146 @@ pub fn transfer_people_into_player(slot: i16) {
 pub fn set_mission_complete() {
     unsafe {
         BYTE_60AFC |= 0x2;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x29270  remove_model
+//
+// Removes entity from the mapwho cell list, then clears its type byte (0x18).
+// ---------------------------------------------------------------------------
+pub fn remove_model(entity: *mut u8) {
+    unsafe {
+        move_off_mapwho(entity);
+        *entity.add(0x18) = 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x29290  animate_model
+//
+// Advances the entity's animation frame (field 0x10 → next frame index via
+// frames table, stride 8). Returns the loop flag (bit 0 of frames[new].field5).
+// ---------------------------------------------------------------------------
+pub fn animate_model(entity: *mut u8) -> u8 {
+    use crate::globals::FRAMES;
+    unsafe {
+        let mut eax: u32 = 0;
+        let edx = entity;
+        eax = *(edx.add(0x10) as *const u16) as u32;
+        let ebx = FRAMES;
+        eax = eax.wrapping_mul(8);
+        eax = (ebx as usize).wrapping_add(eax as usize) as u32;
+        let next_frame = *(eax as *const u8).add(6) as u32
+                       | ((*(eax as *const u8).add(7) as u32) << 8);
+        *(edx.add(0x10) as *mut u16) = next_frame as u16;
+        eax = next_frame.wrapping_mul(8);
+        eax = (ebx as usize).wrapping_add(eax as usize) as u32;
+        let flag = *(eax as *const u8).add(5) & 0x1;
+        flag
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x292d0  move_worlds
+//
+// Applies a small random drift to the wind angle (data_9bc78), then uses the
+// 8.8 sin/cos tables to resolve the current wind speed (data_9bc77) into
+// x-component (level__Worlds) and y-component (data_9bc72).
+// ---------------------------------------------------------------------------
+pub fn move_worlds() {
+    use crate::syndre::funcs_10000::random;
+    use crate::syndre::data::{DATA_5AB60, DATA_5AD60};
+    unsafe {
+        let r = random(9) as u8;
+        DATA_9BC78 = DATA_9BC78.wrapping_add(r).wrapping_sub(2);
+        let angle = DATA_9BC78 as usize;
+        let speed = DATA_9BC77 as i32;
+        let ebx = (DATA_5AB60[angle] as i32).wrapping_mul(speed);
+        let eax = (DATA_5AD60[angle] as i32).wrapping_mul(speed);
+        LEVEL_WORLDS = (sar(ebx as u32, 8) as i32) as i16;
+        DATA_9BC72   = (sar(eax as u32, 8) as i32) as i16;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x29330  affect_by_wind
+//
+// Accumulates the current wind components into the entity-local position
+// accumulators data_60b28/2a.
+// ---------------------------------------------------------------------------
+pub fn affect_by_wind() {
+    unsafe {
+        let wx = LEVEL_WORLDS as i32;
+        let wy = DATA_9BC72 as i32;
+        let dx = DATA_60B28 as i32;
+        let bx = DATA_60B2A as i32;
+        DATA_60B28 = (dx.wrapping_add(wx)) as i16;
+        DATA_60B2A = (bx.wrapping_add(wy)) as i16;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x29360  getdist
+//
+// Returns max(abs(dx), abs(dy)) — the Chebyshev / chessboard distance.
+// ---------------------------------------------------------------------------
+pub fn getdist(dx: i16, dy: i16) -> i16 {
+    unsafe {
+        let ax = ac_abs(dx as i32) as u32;
+        let bx = ac_abs(dy as i32) as u32;
+        if bx <= ax { ax as i16 } else { bx as i16 }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x29390  goto_angle
+//
+// Adds the speed-scaled 2-D displacement for a given angle to the x/y
+// accumulators (data_60b28 / data_60b2a).
+//
+// Arguments: speed (i16), angle (u8 index into sin/cos tables)
+// ---------------------------------------------------------------------------
+pub fn goto_angle(speed: i16, angle: u8) {
+    use crate::syndre::data::{DATA_5AB60, DATA_5AD60};
+    unsafe {
+        let edx = speed as i32;
+        let ebx = angle as usize;
+        let ecx = (DATA_5AB60[ebx] as i32).wrapping_mul(edx);
+        let eax_x = (DATA_60B28 as i32).wrapping_add(sar(ecx as u32, 8) as i32);
+        DATA_60B28 = eax_x as i16;
+        let eax_y = (DATA_5AD60[ebx] as i32).wrapping_mul(edx);
+        let eax_y2 = (DATA_60B2A as i32).wrapping_add(sar(eax_y as u32, 8) as i32);
+        DATA_60B2A = eax_y2 as i16;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x293e0  goto_zangle
+//
+// Like goto_angle but also updates the z accumulator (data_60b2c) using a
+// second angle index.
+//
+// Arguments: speed (i16), xy_angle (u8), z_angle (u8)
+// ---------------------------------------------------------------------------
+pub fn goto_zangle(speed: i16, xy_angle: u8, z_angle: u8) {
+    use crate::syndre::data::{DATA_5AB60, DATA_5AD60};
+    unsafe {
+        let edx = speed as i32;
+        let ebx = xy_angle as usize;
+        // x accumulator
+        let ecx = (DATA_5AB60[ebx] as i32).wrapping_mul(edx);
+        let eax_x = (DATA_60B28 as i32).wrapping_add(sar(ecx as u32, 8) as i32);
+        DATA_60B28 = eax_x as i16;
+        // y accumulator
+        let eax_y = (DATA_5AD60[ebx] as i32).wrapping_mul(edx);
+        let ebx2 = sar(eax_y as u32, 8) as i32;
+        let eax_y2 = (DATA_60B2A as i32).wrapping_add(ebx2);
+        DATA_60B2A = eax_y2 as i16;
+        // z accumulator — uses sin table with second angle
+        let za = z_angle as usize;
+        let eax_z = (DATA_5AB60[za] as i32).wrapping_mul(edx);
+        let eax_z2 = (DATA_60B2C as i32).wrapping_add(sar(eax_z as u32, 8) as i32);
+        DATA_60B2C = eax_z2 as i16;
     }
 }

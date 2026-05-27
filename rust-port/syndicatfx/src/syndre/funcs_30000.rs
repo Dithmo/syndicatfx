@@ -28,6 +28,11 @@ extern "C" {
     fn kill_all_weapons(entity: *mut u8);
     fn agent_check_arc_for_enemy(entity: *mut u8, perception: i32, intelligence: i32) -> *mut u8;
     fn person_use_weapon(entity: *mut u8, tx: i32, ty: i32, tz: i32);
+    fn bump_person(entity: *mut u8, tx: i32, ty: i32, tz: i32,
+                   range1: i32, range2: i32, arg7: i32) -> *mut u8;
+    fn arctan(dx: i32, dy: i32) -> i32;
+    fn i_can_see_and_shoot_person(entity: *mut u8, target: *mut u8, range: i32) -> *mut u8;
+    fn i_can_see_and_shoot_vehicle(entity: *mut u8, target: *mut u8, range: i32) -> *mut u8;
 }
 
 // ---------------------------------------------------------------------------
@@ -1928,5 +1933,481 @@ pub fn fn_s_person_wander(entity: *mut u8) {
         animate_model(ebx);
         let new_state = affect_person(ebx) as u8;
         *ebx.add(0x19) = new_state;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x33370  fn_S_PERSON_PERSUADED
+//
+// Handles a persuaded (mind-controlled) person following their leader.
+// Copies leader's drug stats, tracks their goto target, uses bump_person to
+// avoid collisions, and steers angle ±0x10 per tick toward the leader.
+// ---------------------------------------------------------------------------
+pub fn fn_s_person_persuaded(entity: *mut u8) {
+    use crate::syndre::funcs_20000::{animate_model, goto_angle};
+    unsafe {
+        let ebx = entity;
+        let dx = *(ebx.add(0x20) as *const u16);
+        if dx == 0 {
+            return;
+        }
+        let mut esi = LEVEL_THINGS_BASE.add(dx as usize);
+
+        // If leader is deleted (field_0xb bit0 set): disengage
+        if (*esi.add(0x0b) & 0x1) != 0 {
+            *(ebx.add(0x20) as *mut u16) = 0;
+            let dl = *ebx.add(0xa) & 0xf7;
+            *ebx.add(0xa) = dl;
+            *ebx.add(0x58) = 0x1e; // desired = FOLLOW
+            new_state_person(ebx);
+            return;
+        }
+
+        // Walk leader's vehicle chain looking for type-2 vehicle
+        let mut vdx = *(esi.add(0x24) as *const u16);
+        if vdx != 0 {
+            loop {
+                if vdx == 0 {
+                    break;
+                }
+                let veax = LEVEL_THINGS_BASE.add(vdx as usize);
+                if *veax.add(0x18) == 2 {
+                    *ebx.add(0x19) = 0x5;  // GOTO_VEHICLE
+                    *ebx.add(0x58) = 0x6;  // desired = MOVE_INTO_VEHICLE
+                    *(ebx.add(0x2c) as *mut u16) = vdx;
+                    return;
+                }
+                esi = veax;
+                vdx = *(veax.add(0x24) as *const u16);
+            }
+        }
+
+        // Restore esi to the original follow target (vehicle walk may have changed it)
+        esi = LEVEL_THINGS_BASE.add(dx as usize);
+
+        let cx = *(ebx.add(0x3a) as *const u16);
+
+        if cx == 0 {
+            // Search mapwho tile for free weapons to pick up
+            let ey = *(ebx.add(0x6) as *const i16) as i32;
+            let ex = *(ebx.add(0x4) as *const i16) as i32;
+            let tile_y = ((ey >> 8) & 0x7f) * 128;
+            let tile_x = (ex >> 8) & 0x7f;
+            let mapwho_idx = (tile_y | tile_x) as usize;
+
+            if !LEVEL_MAPWHO.is_null() {
+                let mut ax = *(LEVEL_MAPWHO.add(mapwho_idx * 2) as *const u16) as usize;
+                loop {
+                    if ax == 0 {
+                        break;
+                    }
+                    let thing = LEVEL_THINGS_BASE.add(ax);
+                    if *thing.add(0x18) == 4 {  // type == WEAPON
+                        let ammo = *(thing.add(0x14) as *const i16);
+                        let owned = *(thing.add(0x1e) as *const u16);
+                        let wz = *(thing.add(0x8) as *const i16);
+                        let ez = *(ebx.add(0x8) as *const i16);
+                        if ammo > 0 && owned == 0 && wz == ez {
+                            *ebx.add(0x19) = 0x5;  // GOTO_STRUCT
+                            let offset = (thing as usize)
+                                .wrapping_sub(LEVEL_THINGS_BASE as usize) as u16;
+                            *ebx.add(0x58) = 0x9;  // desired = PICKUP
+                            *(ebx.add(0x2c) as *mut u16) = offset;
+                            break;
+                        }
+                    }
+                    ax = *(thing.add(0x0) as *const u16) as usize;
+                }
+            }
+        } else {
+            // Check if currently held weapon has negative ammo: drop it
+            let weap = LEVEL_THINGS_BASE.add(cx as usize);
+            let ammo = *(weap.add(0x14) as *const i16);
+            if ammo < 0 {
+                *(ebx.add(0x44) as *mut u16) = cx;
+                drop_weapon(ebx);
+            }
+        }
+
+        // jump_33484: if leader is itself following someone else, chain to that target
+        {
+            let ax2 = *(esi.add(0x20) as *const u16);
+            if ax2 != 0 {
+                *(ebx.add(0x20) as *mut u16) = ax2;
+                return;
+            }
+        }
+
+        // Compute perception range for bump sphere (clamped to >= 16)
+        let perc_raw = get_person_perception(esi, 0xc0);
+        let mut edi = (perc_raw as i32).wrapping_add(0x40);
+        if edi < 0x10 {
+            edi = 0x10;
+        }
+
+        // Copy leader's drug enhancement stats
+        *ebx.add(0x49) = *esi.add(0x49);
+        *ebx.add(0x4d) = *esi.add(0x4d);
+        *ebx.add(0x51) = *esi.add(0x51);
+
+        // Select best weapon; if leader has a fatal weapon, choose for entity
+        let fw = fatal_weapon(esi);
+        let chosen: u16 = if fw != 0 {
+            choose_best_weapon(ebx, 0)
+        } else {
+            0
+        };
+        *(ebx.add(0x44) as *mut u16) = chosen;
+
+        // Set walk speed
+        let speed_modifier = *ebx.add(0x55) as i32;
+        let spd = get_person_speed(ebx, speed_modifier);
+        *ebx.add(0x54) = spd as u8;
+
+        // Copy leader's goto target coords
+        *(ebx.add(0x2e) as *mut i16) = *(esi.add(0x2e) as *const i16);
+        *(ebx.add(0x30) as *mut i16) = *(esi.add(0x30) as *const i16);
+
+        // Compute bump target using sin/cos tables + DATA_60B2x accumulators
+        let angle_idx = *ebx.add(0x1a) as usize;
+        let spd_val = *ebx.add(0x54) as i32;
+        let sin_val = *(DATA_5AB60.as_ptr().add(angle_idx * 2) as *const i16) as i32;
+        let cos_val = *(DATA_5AD60.as_ptr().add(angle_idx * 2) as *const i16) as i32;
+        let tx = (DATA_60B28 as i32).wrapping_add((sin_val.wrapping_mul(spd_val)) >> 8);
+        let ty = (DATA_60B2A as i32).wrapping_add((cos_val.wrapping_mul(spd_val)) >> 8);
+        let tz = DATA_60B2C as i32;
+
+        let bump_result = bump_person(ebx, tx, ty, tz, edi, edi, 0x80);
+
+        // Compute signed diff between desired angle and entity's current angle
+        let al: u8 = if !bump_result.is_null() {
+            // Steer toward bump collision entity
+            let col_y = *(bump_result.add(0x6) as *const i16) as i32;
+            let ent_y2 = *(ebx.add(0x6) as *const i16) as i32;
+            let col_x = *(bump_result.add(0x4) as *const i16) as i32;
+            let ent_x2 = *(ebx.add(0x4) as *const i16) as i32;
+            let computed = get_angle(col_x.wrapping_sub(ent_x2), col_y.wrapping_sub(ent_y2));
+            computed.wrapping_sub(*ebx.add(0x1a))
+        } else {
+            // Steer toward goto target
+            let tgt_y2 = *(ebx.add(0x30) as *const i16) as i32;
+            let ent_y2 = *(ebx.add(0x6) as *const i16) as i32;
+            let tgt_x2 = *(ebx.add(0x2e) as *const i16) as i32;
+            let ent_x2 = *(ebx.add(0x4) as *const i16) as i32;
+            let computed = get_angle(tgt_x2.wrapping_sub(ent_x2), tgt_y2.wrapping_sub(ent_y2));
+            (*ebx.add(0x1a)).wrapping_sub(computed)
+        };
+
+        // Rotate entity angle toward target by at most 0x10 per tick
+        let diff = al as i8;
+        if diff < 0 {
+            if diff >= -16 {
+                *ebx.add(0x1a) = (*ebx.add(0x1a)).wrapping_sub(al);
+            } else {
+                *ebx.add(0x1a) = (*ebx.add(0x1a)).wrapping_add(0x10);
+            }
+        } else if diff > 0 {
+            if diff <= 16 {
+                *ebx.add(0x1a) = (*ebx.add(0x1a)).wrapping_add(al);
+            } else {
+                *ebx.add(0x1a) = (*ebx.add(0x1a)).wrapping_sub(0x10);
+            }
+        }
+
+        let cur_angle = *ebx.add(0x1a);
+        let cur_speed = *ebx.add(0x54);
+        goto_angle(cur_speed as i16, cur_angle);
+
+        if person_colide(ebx) != 0 {
+            let dy_g = (*(ebx.add(0x30) as *const i16) as i32)
+                .wrapping_sub(*(ebx.add(0x6) as *const i16) as i32);
+            let dx_g = (*(ebx.add(0x2e) as *const i16) as i32)
+                .wrapping_sub(*(ebx.add(0x4) as *const i16) as i32);
+            let target_angle = get_angle(dx_g, dy_g);
+            let adl = target_angle.wrapping_sub(*ebx.add(0x1a)) as i8 as i32;
+            let hug_speed: u32 = if adl > -16 && (adl as u8) < 0x10 { 0x1f4 } else { 0x14 };
+            decide_on_hug_direction(ebx, hug_speed);
+        }
+
+        let new_state = affect_person(ebx) as u8;
+        *ebx.add(0x19) = new_state;
+        animate_model(ebx);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x33660  fn_S_PERSON_RUNAWAY
+//
+// Flee from entity at field_0x2a. Computes opposite angle using arctan,
+// moves at speed 0x28. Stops when distance > perception range.
+// ---------------------------------------------------------------------------
+pub fn fn_s_person_runaway(entity: *mut u8) {
+    use crate::syndre::funcs_20000::{animate_model, goto_angle};
+    use crate::syndre::funcs_10000::getrdist;
+    unsafe {
+        let ebx = entity;
+        let si = *(ebx.add(0x2a) as *const u16);
+        let esi = LEVEL_THINGS_BASE.add(si as usize);
+
+        if *esi.add(0x18) == 0 {
+            new_state_person(ebx);
+            return;
+        }
+
+        let threat_y = *(esi.add(0x6) as *const i16) as i32;
+        let ent_y   = *(ebx.add(0x6) as *const i16) as i32;
+        let threat_x = *(esi.add(0x4) as *const i16) as i32;
+        let ent_x   = *(ebx.add(0x4) as *const i16) as i32;
+        let dy = threat_y.wrapping_sub(ent_y);
+        let dx = threat_x.wrapping_sub(ent_x);
+        // arctan(dx, dy) returns angle byte; +0x80 gives the opposite direction
+        let angle = (arctan(dx, dy) as u8).wrapping_add(0x80);
+        *ebx.add(0x1a) = angle;
+        *ebx.add(0x54) = 0x28;
+
+        goto_angle(0x28i16, angle);
+
+        if person_colide(ebx) != 0 {
+            quick_decide_on_hug_direction(ebx, 0x32);
+        }
+
+        // Check escape distance vs perception range
+        let dy2 = (*(esi.add(0x6) as *const i16) as i32)
+            .wrapping_sub(*(ebx.add(0x6) as *const i16) as i32);
+        let dx2 = (*(esi.add(0x4) as *const i16) as i32)
+            .wrapping_sub(*(ebx.add(0x4) as *const i16) as i32);
+        let si_dist = getrdist(dx2 as i16, dy2 as i16) as u32;
+        let perception = get_person_perception(ebx, 0xa00) as u32;
+        if si_dist > perception {
+            new_state_person(ebx);
+        }
+
+        animate_model(ebx);
+        let new_state = affect_person(ebx) as u8;
+        *ebx.add(0x19) = new_state;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x33740  fn_S_PERSON_GIVE_WARNING
+//
+// Warning state: stand still, face the threat, count down timer. If timer
+// hits zero or threat is armed, transition to attack state 0x20.
+// ---------------------------------------------------------------------------
+pub fn fn_s_person_give_warning(entity: *mut u8) {
+    unsafe {
+        let ebx = entity;
+        *ebx.add(0x54) = 0;
+
+        let threat_off = *(ebx.add(0x2a) as *const u16) as usize;
+        let threat = LEVEL_THINGS_BASE.add(threat_off);
+        let timer = *(ebx.add(0x2c) as *const u16);
+
+        if timer == 0 || *(threat.add(0x44) as *const u16) != 0 {
+            *ebx.add(0x19) = 0x20; // ATTACK
+            return;
+        }
+
+        let tgt_y = *(threat.add(0x6) as *const i16) as i32;
+        let ent_y = *(ebx.add(0x6) as *const i16) as i32;
+        let tgt_x = *(threat.add(0x4) as *const i16) as i32;
+        let ent_x = *(ebx.add(0x4) as *const i16) as i32;
+        *ebx.add(0x1a) = get_angle(tgt_x.wrapping_sub(ent_x), tgt_y.wrapping_sub(ent_y));
+
+        *(ebx.add(0x2c) as *mut u16) = timer.wrapping_sub(1);
+
+        let new_state = affect_person(ebx) as u8;
+        *ebx.add(0x19) = new_state;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x337b0  fn_S_PERSON_FOLLOW_AND_ATTACK
+//
+// Follow a target (field_0x2a) and attack it. Handles vehicle-mounted and
+// on-foot targets separately, uses i_can_see_and_shoot_* for LOS checks
+// and person_use_weapon to fire. Timer at field_0x42 gates attack frequency.
+// ---------------------------------------------------------------------------
+pub fn fn_s_person_follow_and_attack(entity: *mut u8) {
+    use crate::syndre::funcs_20000::{animate_model, goto_angle};
+    use crate::syndre::funcs_10000::getrdist;
+    unsafe {
+        let ebx = entity;
+        let si = *(ebx.add(0x2a) as *const u16);
+        let esi = LEVEL_THINGS_BASE.add(si as usize);
+
+        // Face the target
+        let tgt_y = *(esi.add(0x6) as *const i16) as i32;
+        let ent_y = *(ebx.add(0x6) as *const i16) as i32;
+        let tgt_x = *(esi.add(0x4) as *const i16) as i32;
+        let ent_x = *(ebx.add(0x4) as *const i16) as i32;
+        *ebx.add(0x1a) = get_angle(tgt_x.wrapping_sub(ent_x), tgt_y.wrapping_sub(ent_y));
+        *ebx.add(0x46) = 0;
+
+        // If timer set and target in z-band: keep timer at -1 (continuous fire)
+        let weapon_ref = *(ebx.add(0x3a) as *const u16);
+        if weapon_ref != 0 && (*esi.add(0x0b) & 0x1) == 0 {
+            let zdiff = ac_abs(
+                (*(esi.add(0x8) as *const i16) as i32)
+                    .wrapping_sub(*(ebx.add(0x8) as *const i16) as i32)
+            );
+            if zdiff < 0x100 {
+                *(ebx.add(0x42) as *mut i16) = -1i16;
+            }
+        }
+
+        // Choose best weapon; bail to RELOAD if empty
+        let best = choose_best_weapon(ebx, 0);
+        let ebp = LEVEL_THINGS_BASE.add(best as usize);
+        *(ebx.add(0x44) as *mut u16) = best;
+        if (*(ebp.add(0x14) as *const i16)) < 0 {
+            *(ebx.add(0x44) as *mut u16) = 0;
+            *ebx.add(0x46) = 0;
+            *ebx.add(0x19) = 0x1f;
+            return;
+        }
+
+        let vdx0 = *(esi.add(0x24) as *const u16);
+
+        if vdx0 != 0 {
+            // --- Target is in a vehicle chain ---
+            let mut vdx = vdx0;
+            let mut target_veh: *mut u8 = LEVEL_THINGS_BASE.add(vdx0 as usize);
+            loop {
+                if vdx == 0 { break; }
+                let vthing = LEVEL_THINGS_BASE.add(vdx as usize);
+                let vtype = *vthing.add(0x18);
+                if vtype == 1 {
+                    vdx = *(vthing.add(0x24) as *const u16);
+                } else if vtype == 2 {
+                    target_veh = vthing;
+                    break;
+                } else {
+                    break; // unreachable in practice
+                }
+            }
+
+            let dy_v = (*(target_veh.add(0x6) as *const i16) as i32)
+                .wrapping_sub(*(ebx.add(0x6) as *const i16) as i32);
+            let dx_v = (*(target_veh.add(0x4) as *const i16) as i32)
+                .wrapping_sub(*(ebx.add(0x4) as *const i16) as i32);
+            let dist_v = getrdist(dx_v as i16, dy_v as i16);
+
+            if (dist_v as u16) < 0x80 {
+                // Too close: back off
+                let spd = get_person_speed(ebx, *ebx.add(0x55) as i32);
+                *ebx.add(0x54) = spd as u8;
+                let ang = (*ebx.add(0x1a)).wrapping_add(0x80);
+                goto_angle(spd as i16, ang);
+                person_colide(ebx);
+            } else {
+                let wtype = *ebp.add(0x19) as usize;
+                let range = DATA_5A6C2[wtype] as i32;
+                let perception = get_person_perception(ebx, range);
+
+                let can_see = i_can_see_and_shoot_vehicle(ebx, target_veh, perception);
+                if can_see == target_veh {
+                    let vz = (*(target_veh.add(0x8) as *const i16) as i32).wrapping_add(0x80);
+                    let vy = *(target_veh.add(0x6) as *const i16) as i32;
+                    let vx = *(target_veh.add(0x4) as *const i16) as i32;
+                    person_use_weapon(ebx, vx, vy, vz);
+                    let adrn = get_person_adrenlin(ebx, 0x32);
+                    *ebx.add(0x58) = 0xd;
+                    *(ebx.add(0x2c) as *mut u16) = (0x32i32 - adrn) as u16;
+                    return;
+                }
+
+                if (dist_v as u32) >= 0x300 {
+                    let spd = get_person_speed(ebx, *ebx.add(0x55) as i32);
+                    *ebx.add(0x54) = spd as u8;
+                    let ang = *ebx.add(0x1a);
+                    goto_angle(spd as i16, ang);
+                    if person_colide(ebx) != 0 {
+                        quick_decide_on_hug_direction(ebx, 0xa);
+                    }
+                }
+            }
+            animate_model(ebx);
+        } else {
+            // --- Target is on foot ---
+            let dy_f = (*(esi.add(0x6) as *const i16) as i32)
+                .wrapping_sub(*(ebx.add(0x6) as *const i16) as i32);
+            let dx_f = (*(esi.add(0x4) as *const i16) as i32)
+                .wrapping_sub(*(ebx.add(0x4) as *const i16) as i32);
+            let dist_f = getrdist(dx_f as i16, dy_f as i16);
+
+            if (dist_f as u16) < 0x80 {
+                let spd = get_person_speed(ebx, *ebx.add(0x55) as i32);
+                *ebx.add(0x54) = spd as u8;
+                let ang = (*ebx.add(0x1a)).wrapping_add(0x80);
+                goto_angle(spd as i16, ang);
+                person_colide(ebx);
+                animate_model(ebx);
+            } else {
+                let wtype = *ebp.add(0x19) as usize;
+                let range = DATA_5A6C2[wtype] as i32;
+                let perception = get_person_perception(ebx, range);
+
+                let can_see = i_can_see_and_shoot_person(ebx, esi, perception);
+                if !can_see.is_null() {
+                    // Check if target is shielding (weapon state 0x11)
+                    let armed = *(esi.add(0x44) as *const u16);
+                    let shielding = armed != 0 && {
+                        let armed_thing = LEVEL_THINGS_BASE.add(armed as usize);
+                        *armed_thing.add(0x19) == 0x11
+                    };
+                    if !shielding {
+                        let tz = (*(esi.add(0x8) as *const i16) as i32).wrapping_add(0x80);
+                        let ty2 = *(esi.add(0x6) as *const i16) as i32;
+                        let tx2 = *(esi.add(0x4) as *const i16) as i32;
+                        person_use_weapon(ebx, tx2, ty2, tz);
+                        let adrn = get_person_adrenlin(ebx, 0x32);
+                        *ebx.add(0x58) = 0xd;
+                        *(ebx.add(0x2c) as *mut u16) = (0x32i32 - adrn) as u16;
+                        return;
+                    }
+                } else if (dist_f as u32) >= 0x300 {
+                    let spd = get_person_speed(ebx, *ebx.add(0x55) as i32);
+                    *ebx.add(0x54) = spd as u8;
+                    let ang = *ebx.add(0x1a);
+                    goto_angle(spd as i16, ang);
+                    if person_colide(ebx) != 0 {
+                        quick_decide_on_hug_direction(ebx, 0xa);
+                    }
+                }
+                animate_model(ebx);
+            }
+        }
+
+        // jump_33af8: per-tick fire cooldown timer
+        let si_timer = *(ebx.add(0x42) as *const i16);
+        if si_timer < 0 {
+            let adrn = get_person_adrenlin(ebx, 0x32);
+            *ebx.add(0x19) = 0xd; // WAIT_FOR_VEHICLE
+            *(ebx.add(0x2c) as *mut u16) = (0x32i32 - adrn) as u16;
+        } else if si_timer > 0 {
+            *(ebx.add(0x42) as *mut i16) = si_timer.wrapping_sub(1);
+        }
+
+        let new_state = affect_person(ebx) as u8;
+        *ebx.add(0x19) = new_state;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x33b40  fn_S_PERSON_DROWN
+//
+// Drowning state: play death animation; when it finishes, mark entity DEAD.
+// ---------------------------------------------------------------------------
+pub fn fn_s_person_drown(entity: *mut u8) {
+    use crate::syndre::funcs_20000::animate_model;
+    unsafe {
+        let ebx = entity;
+        *ebx.add(0x54) = 0;
+        let done = animate_model(ebx);
+        if done != 0 {
+            *ebx.add(0x19) = 0x1a; // DEAD
+            *ebx.add(0xa) = *ebx.add(0xa) | 0x1;
+        }
     }
 }

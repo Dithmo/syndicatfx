@@ -19,6 +19,10 @@ extern "C" {
     fn person_colide(entity: *mut u8) -> u16;
     fn decide_on_hug_direction(entity: *mut u8, speed: u32);
     fn drop_weapon(entity: *mut u8);
+    fn do_a_hug(entity: *mut u8, dir: i32) -> u16;
+    fn fatal_weapon(entity: *mut u8) -> u16;
+    fn choose_best_weapon(entity: *mut u8, arg2: i32) -> u16;
+    fn random(max: i32) -> i32;
 }
 
 // ---------------------------------------------------------------------------
@@ -1236,5 +1240,173 @@ pub fn fn_s_person_wait_for_time(entity: *mut u8) {
 
         let new_state = affect_person(ebx) as u8;
         *ebx.add(0x19) = new_state;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared inner loop for fn_S_PERSON_HUG_RIGHT / HUG_LEFT.
+//
+// Checks whether entity has reached its tile-level goto target, syncs drug
+// stats from the follow target, then calls do_a_hug(entity, dir). On success
+// moves entity via goto_angle + move_mapwho, animates, and calls affect_person.
+// Called from HUG_RIGHT (dir = -64) and HUG_LEFT (dir = +64).
+// ---------------------------------------------------------------------------
+#[inline]
+fn hug_common(entity: *mut u8, dir: i32) {
+    use crate::syndre::data::{LEVEL_THINGS_BASE, DATA_60B28, DATA_60B2A, DATA_60B2C, DATA_5E128};
+    use crate::syndre::funcs_20000::{move_mapwho, animate_model, goto_angle};
+    unsafe {
+        let ebx = entity;
+
+        // Check tile-level arrival (entity.field_0x2e/30 vs DATA_60B28/2A, both >> 8)
+        let ex_tile = (*(ebx.add(0x2e) as *const i16) as i32) >> 8;
+        let ey_tile = (*(ebx.add(0x30) as *const i16) as i32) >> 8;
+        let tx_tile = (DATA_60B28 as i32) >> 8;
+        let ty_tile = (DATA_60B2A as i32) >> 8;
+        if ex_tile == tx_tile && ey_tile == ty_tile {
+            // Arrived at target
+            new_state_person(ebx);
+            return;
+        }
+
+        let follow_link = *(ebx.add(0x20) as *const u16);
+        if follow_link != 0 {
+            let esi = LEVEL_THINGS_BASE.add(follow_link as usize);
+
+            // If follow target has different goto target → relinquish
+            let fx_tile = (*(esi.add(0x2e) as *const i16) as i32) >> 8;
+            let fy_tile = (*(esi.add(0x30) as *const i16) as i32) >> 8;
+            if fx_tile != ex_tile || fy_tile != ey_tile {
+                new_state_person(ebx);
+            }
+
+            // Sync drug stats from follow target
+            *ebx.add(0x49) = *esi.add(0x49);
+            *ebx.add(0x4d) = *esi.add(0x4d);
+            *ebx.add(0x51) = *esi.add(0x51);
+
+            let ax = fatal_weapon(esi);
+            let chosen = if ax != 0 { choose_best_weapon(ebx, 0) } else { 0 };
+            *(ebx.add(0x44) as *mut u16) = chosen;
+
+            if (*esi.add(0x0b) & 0x1) != 0 {
+                // Follow target dead — stop following
+                *(ebx.add(0x20) as *mut u16) = 0;
+                *ebx.add(0x0a) &= !0x8;
+                *ebx.add(0x58) = 0x1e;
+                new_state_person(ebx);
+                return;
+            }
+
+            // Compute speed
+            let speed_mod = *ebx.add(0x55) as i32;
+            let spd = get_person_speed(ebx, speed_mod) as u8;
+            *ebx.add(0x54) = spd;
+        }
+
+        // Attempt hug movement
+        let hug_ok = do_a_hug(ebx, dir);
+        if hug_ok == 0 {
+            // Can't hug / arrived — relinquish
+            new_state_person(ebx);
+            return;
+        }
+
+        // Move in hug direction
+        let speed_mod = *ebx.add(0x55) as i32;
+        let spd = get_person_speed(ebx, speed_mod) as u8;
+        *ebx.add(0x54) = spd;
+
+        let angle = *ebx.add(0x1a) as u32 as u16;
+        let speed = *ebx.add(0x54) as u32 as u16;
+        goto_angle(speed as i16, angle as u8);
+
+        let z_arg = (DATA_60B2C as i16).wrapping_add(DATA_5E128);
+        move_mapwho(ebx, DATA_60B28 as i16, DATA_60B2A as i16, z_arg);
+        animate_model(ebx);
+        let new_state = affect_person(ebx) as u8;
+        *ebx.add(0x19) = new_state;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x32930  fn_S_PERSON_HUG_RIGHT
+//
+// Wall-hug state that turns clockwise (right, dir = -64) when blocked.
+// Delegates to hug_common after the per-entity setup.
+//
+// Literal translation of 0x32930–0x32a97.
+// ---------------------------------------------------------------------------
+pub fn fn_s_person_hug_right(entity: *mut u8) {
+    unsafe { hug_common(entity, -64); }
+}
+
+// ---------------------------------------------------------------------------
+// 0x32aa0  fn_S_PERSON_HUG_LEFT
+//
+// Wall-hug state that turns counter-clockwise (left, dir = +64) when blocked.
+//
+// Literal translation of 0x32aa0–0x32c0e.
+// ---------------------------------------------------------------------------
+pub fn fn_s_person_hug_left(entity: *mut u8) {
+    unsafe { hug_common(entity, 64); }
+}
+
+// ---------------------------------------------------------------------------
+// 0x32c10  fn_S_PERSON_ON_FIRE
+//
+// Burning entity state. Decrements the speed-ref counter (field_0x42). When
+// it goes negative: if ammo (field_0x14) is negative → state 0x19 (DYING),
+// else clear state bits and call new_state_person. While counter >= 0: add
+// random ±7 to angle, clamp adrenalin += 6 to 0xff, compute speed, call
+// goto_angle + person_colide + animate_model.
+//
+// Literal translation of 0x32c10–0x32c83.
+// ---------------------------------------------------------------------------
+pub fn fn_s_person_on_fire(entity: *mut u8) {
+    use crate::syndre::funcs_20000::{animate_model, goto_angle};
+    unsafe {
+        let ebx = entity;
+        *ebx.add(0x0b) |= 0x2; // set "on fire" flag
+
+        let ax = *(ebx.add(0x42) as *const i16);
+        let new_ax = ax.wrapping_sub(1);
+        *(ebx.add(0x42) as *mut i16) = new_ax;
+
+        if ax < 0 {
+            // Counter expired
+            if *(ebx.add(0x14) as *const i16) < 0 {
+                *ebx.add(0x19) = 0x19; // DYING state
+                return;
+            }
+            // Clear on-fire bits and relinquish
+            let mut cx = *(ebx.add(0x0a) as *const u16);
+            cx &= 0xfdf7; // clear bits 3 and 9
+            *(ebx.add(0x0a) as *mut u16) = cx;
+            new_state_person(ebx);
+            return;
+        }
+
+        // Still burning — randomise angle
+        let rand_val = random(0xf) as i8; // 0..15
+        let jitter = rand_val.wrapping_sub(7) as i8; // -7..8
+        let dl = (*ebx.add(0x1a) as i8).wrapping_add(jitter) as u8;
+        *ebx.add(0x1a) = dl;
+
+        // Boost adrenalin
+        let adrn = *ebx.add(0x49) as i32;
+        let clamped = (adrn + 6).min(0xff) as u8;
+        *ebx.add(0x49) = clamped;
+
+        // Move in fire direction
+        let speed_mod = *ebx.add(0x55) as i32;
+        let spd = get_person_speed(ebx, speed_mod) as u8;
+        *ebx.add(0x54) = spd;
+
+        let angle = *ebx.add(0x1a) as u32 as u16;
+        let speed = *ebx.add(0x54) as u32 as u16;
+        goto_angle(speed as i16, angle as u8);
+        person_colide(ebx);
+        animate_model(ebx);
     }
 }

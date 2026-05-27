@@ -179,6 +179,7 @@ pub static mut THING_DRAWLIST: [u8; 16 * 1024] = [0u8; 16 * 1024];
 // ---- UI / panel state -------------------------------------------------------
 pub static mut DATA_5E122: u16 = 0;
 pub static mut DATA_5E124: u16 = 0;
+pub static mut DATA_5E128: i16 = 0; // z-displacement added to DATA_60B2C in hug moves
 pub static mut DATA_5E110: u16 = 0;
 pub static mut DATA_5E112: u16 = 0;
 pub static mut DATA_5E11E: u16 = 0;

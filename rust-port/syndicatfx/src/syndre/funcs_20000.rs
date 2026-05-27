@@ -38,8 +38,6 @@ extern "C" {
     fn move_effects();
     fn move_objects();
     fn move_vehicles();
-    fn move_off_mapwho(entity: *mut u8);
-    fn ac_abs(val: i32) -> i32;
 }
 
 // ---- Data segment pointers used in this translation block -------------------
@@ -704,11 +702,9 @@ pub fn affect_by_wind() {
 // Returns max(abs(dx), abs(dy)) — the Chebyshev / chessboard distance.
 // ---------------------------------------------------------------------------
 pub fn getdist(dx: i16, dy: i16) -> i16 {
-    unsafe {
-        let ax = ac_abs(dx as i32) as u32;
-        let bx = ac_abs(dy as i32) as u32;
-        if bx <= ax { ax as i16 } else { bx as i16 }
-    }
+    let ax = (dx as i32).unsigned_abs();
+    let bx = (dy as i32).unsigned_abs();
+    if bx <= ax { ax as i16 } else { bx as i16 }
 }
 
 // ---------------------------------------------------------------------------
@@ -760,5 +756,217 @@ pub fn goto_zangle(speed: i16, xy_angle: u8, z_angle: u8) {
         let eax_z = (DATA_5AB60[za] as i32).wrapping_mul(edx);
         let eax_z2 = (DATA_60B2C as i32).wrapping_add(sar(eax_z as u32, 8) as i32);
         DATA_60B2C = eax_z2 as i16;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x29460  get_angle
+//
+// Computes the 256-unit angle from (0,0) toward (dx, dy).
+// Thin wrapper: sign-extends both args to i32 and tail-calls arctan.
+// ---------------------------------------------------------------------------
+pub fn get_angle(dx: i16, dy: i16) -> u16 {
+    crate::syndre::funcs_40000::arctan(dx, dy)
+}
+
+// ---------------------------------------------------------------------------
+// 0x29480  goto_point
+//
+// If the current speed is large enough to reach (dx,dy) this tick, applies
+// the full displacement to the accumulators and returns -1 (arrived).
+// Otherwise computes the angle toward the target, applies one speed-scaled
+// step via goto_angle, and returns the angle.
+//
+// Arguments: speed (i16), dx (i16), dy (i16)
+// Returns:   -1 (i32) if arrived, else the angle as u16
+// ---------------------------------------------------------------------------
+pub fn goto_point(speed: i16, dx: i16, dy: i16) -> i32 {
+    use crate::syndre::funcs_40000::arctan;
+    use crate::syndre::data::{DATA_5AB60, DATA_5AD60};
+    unsafe {
+        let edx = dx as i32;
+        let eax = dy as i32;
+        let ebx = speed as i32;
+
+        // Compare speed² against dx²+dy²
+        let dist_sq = edx.wrapping_mul(edx).wrapping_add(eax.wrapping_mul(eax));
+        let spd_sq  = ebx.wrapping_mul(ebx);
+
+        if spd_sq > dist_sq {
+            // Close enough — full step, return -1
+            DATA_60B28 = (DATA_60B28 as i32).wrapping_add(edx) as i16;
+            DATA_60B2A = (DATA_60B2A as i32).wrapping_add(eax) as i16;
+            return -1_i32;
+        }
+
+        // Partial step — compute angle then apply goto_angle
+        let angle = arctan(dx, dy) as usize;
+        let ecx = (DATA_5AB60[angle] as i32).wrapping_mul(ebx);
+        let new_x = (DATA_60B28 as i32).wrapping_add(sar(ecx as u32, 8) as i32);
+        DATA_60B28 = new_x as i16;
+        let edy = (DATA_5AD60[angle] as i32).wrapping_mul(ebx);
+        let new_y = (DATA_60B2A as i32).wrapping_add(sar(edy as u32, 8) as i32);
+        DATA_60B2A = new_y as i16;
+        angle as i32
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helper: compute mapwho cell byte-offset from entity field_4 / field_6.
+// Used by move_off_mapwho, move_on_mapwho, and move_mapwho.
+//
+// field_4 (i16): x position; field_4 >> 8 = tile_x (signed)
+// field_6 (u16): y position; (field_6 >> 8) & 0x7F = tile_y_raw
+// cell = (tile_x & 0x7F) | (tile_y_raw * 128)
+// byte_offset = cell * 2
+// ---------------------------------------------------------------------------
+#[inline]
+unsafe fn mapwho_cell_offset(entity: *const u8) -> usize {
+    let f4 = *(entity.add(4) as *const i16) as i32;
+    let f6 = *(entity.add(6) as *const u16);
+    let tile_x = (f4 >> 8) & 0x7F;
+    let tile_y = ((f6 >> 8) & 0x7F) as i32;
+    ((tile_x | (tile_y << 7)) as usize) << 1
+}
+
+// ---------------------------------------------------------------------------
+// 0x29660  move_off_mapwho
+//
+// Unlinks entity from the mapwho spatial cell it currently occupies.
+// Entity fields (u16 offsets from LEVEL_THINGS_BASE):
+//   field_0: next link   field_2: prev link (0 = head of list)
+//   field_0xa bit 2: "on mapwho" flag
+// ---------------------------------------------------------------------------
+pub fn move_off_mapwho(entity: *mut u8) {
+    unsafe {
+        if (*entity.add(0xa) & 0x4) == 0 { return; }
+
+        let cell_off = mapwho_cell_offset(entity);
+        let mapwho_ptr = LEVEL_MAPWHO.add(cell_off) as *mut u16;
+
+        let prev_link = *(entity.add(2) as *const u16);
+        let next_link = *(entity.add(0) as *const u16);
+
+        // Find the slot to write next_link into (either head cell or prev.field_0)
+        let write_next: *mut u16 = if prev_link != 0 {
+            LEVEL_THINGS_BASE.add(prev_link as usize) as *mut u16
+        } else {
+            mapwho_ptr
+        };
+        *write_next = next_link;
+
+        // Update next entity's prev link
+        if next_link != 0 {
+            let next_entity = LEVEL_THINGS_BASE.add(next_link as usize);
+            *(next_entity.add(2) as *mut u16) = prev_link;
+        }
+
+        *entity.add(0xa) &= !0x4;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x296d0  move_on_mapwho
+//
+// Links entity into the mapwho cell for its new position (field_4, field_6
+// come from the arguments, not entity fields, at call time).
+// Arguments: entity, new_x (i16), new_y (i16), new_z (i16)
+//
+// The entity is prepended to the head of the target cell's list.
+// ---------------------------------------------------------------------------
+pub fn move_on_mapwho(entity: *mut u8, new_x: i16, new_y: i16, new_z: i16) {
+    unsafe {
+        if (*entity.add(0xa) & 0x4) != 0 { return; }
+
+        // Compute cell from the NEW coordinates being written
+        let f4_val = new_x;
+        let f6_val = new_y as u16;
+        let tile_x = ((f4_val as i32) >> 8) & 0x7F;
+        let tile_y = ((f6_val >> 8) & 0x7F) as i32;
+        let cell_off = ((tile_x | (tile_y << 7)) as usize) << 1;
+        let mapwho_ptr = LEVEL_MAPWHO.add(cell_off) as *mut u16;
+
+        // Byte offset of entity from LEVEL_THINGS_BASE
+        let ent_off = (entity as usize).wrapping_sub(LEVEL_THINGS_BASE as usize);
+
+        // Prepend: entity.field_2 = 0; entity.field_0 = *mapwho_cell; *mapwho_cell = ent_off
+        *(entity.add(2) as *mut u16) = 0;
+        let old_head = *mapwho_ptr;
+        *(entity.add(0) as *mut u16) = old_head;
+        if old_head != 0 {
+            let old_head_ent = LEVEL_THINGS_BASE.add(old_head as usize);
+            *(old_head_ent.add(2) as *mut u16) = ent_off as u16;
+        }
+        *mapwho_ptr = ent_off as u16;
+        *entity.add(0xa) |= 0x4;
+
+        // Write new position fields
+        *(entity.add(4) as *mut i16) = new_x;
+        *(entity.add(6) as *mut i16) = new_y;
+        *(entity.add(8) as *mut i16) = new_z;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x29530  move_mapwho
+//
+// Moves an entity from its current cell to a new one, clamping coordinates
+// to stay within map bounds (0x200..0x7E00 for x, 0x200..0x5E00 for y).
+// Arguments: entity, new_x (i16), new_y (i16), new_z (i16)
+// ---------------------------------------------------------------------------
+pub fn move_mapwho(entity: *mut u8, mut new_x: i16, mut new_y: i16, new_z: i16) {
+    unsafe {
+        // Clamp x to [0x200, 0x7E00)
+        let tx = (new_x as i32) >> 8;
+        let ty = (new_y as i32) >> 8;
+        if tx < 1   { new_x = 0x7e00_u16 as i16; }
+        if ty < 1   { new_y = 0x5e00_u16 as i16; }
+        if tx >= 0x7f { new_x = 0x0200_u16 as i16; }
+        if ty >= 0x5f { new_y = 0x0200_u16 as i16; }
+
+        // Compute old and new cell offsets
+        let old_cell = mapwho_cell_offset(entity);
+        let new_tile_x = ((new_x as i32) >> 8) & 0x7F;
+        let new_tile_y = (((new_y as u16) >> 8) & 0x7F) as i32;
+        let new_cell = ((new_tile_x | (new_tile_y << 7)) as usize) << 1;
+
+        if old_cell != new_cell {
+            let on_flag = *entity.add(0xa) & 0x4;
+            if on_flag != 0 {
+                // Remove from old cell
+                let old_mw = LEVEL_MAPWHO.add(old_cell) as *mut u16;
+                let prev = *(entity.add(2) as *const u16);
+                let next = *(entity.add(0) as *const u16);
+                let write_next: *mut u16 = if prev != 0 {
+                    LEVEL_THINGS_BASE.add(prev as usize) as *mut u16
+                } else {
+                    old_mw
+                };
+                *write_next = next;
+                if next != 0 {
+                    let ne = LEVEL_THINGS_BASE.add(next as usize);
+                    *(ne.add(2) as *mut u16) = prev;
+                }
+                *entity.add(0xa) &= !0x4;
+            }
+            if (*entity.add(0xa) & 0x4) == 0 {
+                // Prepend into new cell
+                let new_mw = LEVEL_MAPWHO.add(new_cell) as *mut u16;
+                let ent_off = (entity as usize).wrapping_sub(LEVEL_THINGS_BASE as usize);
+                *(entity.add(2) as *mut u16) = 0;
+                let old_head = *new_mw;
+                *(entity.add(0) as *mut u16) = old_head;
+                if old_head != 0 {
+                    let ohe = LEVEL_THINGS_BASE.add(old_head as usize);
+                    *(ohe.add(2) as *mut u16) = ent_off as u16;
+                }
+                *new_mw = ent_off as u16;
+                *entity.add(0xa) |= 0x4;
+            }
+        }
+        // Write new position
+        *(entity.add(4) as *mut i16) = new_x;
+        *(entity.add(6) as *mut i16) = new_y;
+        *(entity.add(8) as *mut i16) = new_z;
     }
 }

@@ -1265,3 +1265,39 @@ pub fn new_weapon() -> *mut u8 {
         std::ptr::null_mut()
     }
 }
+
+// ---------------------------------------------------------------------------
+// 0x273c0  atoi_hex
+//
+// Parses an uppercase hex string right-to-left and returns the u32 value.
+// Only '0'-'9' and 'A'-'F' contribute; all other characters advance the bit
+// position without contributing (matching x86 jump-table dispatch behaviour).
+// Lowercase hex is NOT recognised ('a'-'f' subtract to 0x31..0x36 > 0x16).
+//
+// Literal: reproduces right-to-left scan, 4-bit-per-char accumulation,
+// and the x86 shift-count masking (& 31).
+// ---------------------------------------------------------------------------
+pub fn atoi_hex(s: *const u8) -> u32 {
+    if s.is_null() { return 0; }
+    unsafe {
+        let mut len: usize = 0;
+        while *s.add(len) != 0 { len += 1; }
+        if len == 0 { return 0; }
+        let mut result: u32 = 0;
+        let mut bit_pos: u32 = 0;
+        for i in (0..len).rev() {
+            let v = (*s.add(i)).wrapping_sub(b'0');
+            let digit: Option<u32> = match v {
+                0..=9  => Some(v as u32),
+                // 'A'-'0'=0x11=17 .. 'F'-'0'=0x16=22
+                0x11..=0x16 => Some((v - 0x11 + 10) as u32),
+                _ => None,
+            };
+            if let Some(d) = digit {
+                result |= d.wrapping_shl(bit_pos & 31);
+            }
+            bit_pos = bit_pos.wrapping_add(4);
+        }
+        result
+    }
+}

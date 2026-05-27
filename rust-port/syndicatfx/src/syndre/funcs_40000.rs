@@ -3,6 +3,15 @@
 use crate::syndre::data::DATA_5A95E;
 
 // ---------------------------------------------------------------------------
+// 0x29460  get_angle
+//
+// Thin wrapper: sign-extends both i16 args then delegates to arctan.
+// ---------------------------------------------------------------------------
+pub fn get_angle(dx: i32, dy: i32) -> u8 {
+    arctan(dx as i16, dy as i16) as u8
+}
+
+// ---------------------------------------------------------------------------
 // 0x4fad9  arctan
 //
 // 8-direction fixed-point arctangent. Maps a 2-D delta (dx, dy) to an angle

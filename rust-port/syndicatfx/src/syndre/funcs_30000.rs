@@ -5,6 +5,7 @@
 
 use crate::globals::*;
 use crate::syndre::data::*;
+use crate::syndre::funcs_40000::get_angle;
 
 // Untranslated functions called from this range
 extern "C" {
@@ -20,19 +21,26 @@ extern "C" {
     fn decide_on_hug_direction(entity: *mut u8, speed: u32);
     fn drop_weapon(entity: *mut u8);
     fn do_a_hug(entity: *mut u8, dir: i32) -> u16;
-    fn fatal_weapon(entity: *mut u8) -> u16;
     fn choose_best_weapon(entity: *mut u8, arg2: i32) -> u16;
     fn random(max: i32) -> i32;
-    fn get_angle(dx: i32, dy: i32) -> u8;
     fn drop_all_weapons(entity: *mut u8);
     fn kill_all_weapons(entity: *mut u8);
-    fn agent_check_arc_for_enemy(entity: *mut u8, perception: i32, intelligence: i32) -> *mut u8;
     fn person_use_weapon(entity: *mut u8, tx: i32, ty: i32, tz: i32);
     fn bump_person(entity: *mut u8, tx: i32, ty: i32, tz: i32,
                    range1: i32, range2: i32, arg7: i32) -> *mut u8;
-    fn arctan(dx: i32, dy: i32) -> i32;
     fn i_can_see_and_shoot_person(entity: *mut u8, target: *mut u8, range: i32) -> *mut u8;
     fn i_can_see_and_shoot_vehicle(entity: *mut u8, target: *mut u8, range: i32) -> *mut u8;
+    // move_people helpers
+    fn person_intel();
+    fn person_on_block(entity: *mut u8);
+    fn adjust_bar_levels(entity: *mut u8);
+    fn person_danger(entity: *mut u8);
+    fn weapon_is_empty(entity: *mut u8) -> u16;
+    fn which_frame_person(entity: *mut u8);
+    // FSM helpers still in C
+    fn check_for_on_coming_cars(x: i32, y: i32, z: i32) -> u16;
+    fn there_is_a_road_here(x: i32, y: i32, z: i32) -> u16;
+    fn auto_weapon(entity: *mut u8) -> u16;
 }
 
 // ---------------------------------------------------------------------------
@@ -2160,8 +2168,9 @@ pub fn fn_s_person_runaway(entity: *mut u8) {
         let ent_x   = *(ebx.add(0x4) as *const i16) as i32;
         let dy = threat_y.wrapping_sub(ent_y);
         let dx = threat_x.wrapping_sub(ent_x);
-        // arctan(dx, dy) returns angle byte; +0x80 gives the opposite direction
-        let angle = (arctan(dx, dy) as u8).wrapping_add(0x80);
+        // arctan(dx, dy) → +0x80 gives the opposite (flee) direction
+        let angle = crate::syndre::funcs_40000::arctan(dx as i16, dy as i16)
+            .wrapping_add(0x80) as u8;
         *ebx.add(0x1a) = angle;
         *ebx.add(0x54) = 0x28;
 
@@ -2408,6 +2417,545 @@ pub fn fn_s_person_drown(entity: *mut u8) {
         if done != 0 {
             *ebx.add(0x19) = 0x1a; // DEAD
             *ebx.add(0xa) = *ebx.add(0xa) | 0x1;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x3a0d0  fatal_weapon
+//
+// Returns the "fatality rating" of an entity's currently selected weapon
+// (DATA_5A686[weapon.type]). Returns 0 if no valid weapon equipped.
+// ---------------------------------------------------------------------------
+pub fn fatal_weapon(entity: *const u8) -> u16 {
+    unsafe {
+        let offset = *(entity.add(0x44) as *const u16) as usize;
+        let weapon_ptr = LEVEL_THINGS_BASE.add(offset);
+        if weapon_ptr < LEVEL_WEAPONS {
+            return 0;
+        }
+        let wtype = (*weapon_ptr.add(0x19) as usize) & 0xff;
+        DATA_5A686[wtype.min(9)] as u16
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x316d0  agent_check_arc_for_enemy
+//
+// Scan all active persons looking for a hostile target visible from `entity`.
+// Skips persons in the same group-of-8 as `entity`. Calls
+// i_can_see_and_shoot_person(entity, candidate, perception) on each
+// qualifying person. Returns first visible enemy or null.
+//
+// Qualifying criteria: type==1, has weapon OR flag 0x2 in field_0x1c,
+// field_0xa bits 0x109 clear (not dead/inactive), field_0x20 == 0.
+// ---------------------------------------------------------------------------
+pub fn agent_check_arc_for_enemy(
+    entity: *mut u8,
+    perception: i32,
+    intelligence: i32,
+) -> *mut u8 {
+    unsafe {
+        if intelligence <= 0 {
+            return std::ptr::null_mut();
+        }
+
+        // Compute entity's group start index (entity_idx rounded down to multiple of 8)
+        let offset_bytes = (entity as usize).wrapping_sub(LEVEL_THINGS_BASE as usize) as u16;
+        let entity_idx = (offset_bytes as usize) / 0x5c;
+        let group_start = (entity_idx & !7) as u16; // matches `and $0xf8, %al`
+
+        let mut ebx = LEVEL_PEOPLE;
+        if ebx >= LAST_PERSON {
+            return std::ptr::null_mut();
+        }
+
+        let mut si: u16 = 0; // scan index
+        let di = group_start;
+
+        loop {
+            // Skip same group: di <= si < di+8
+            let in_group = si >= di && si < di.wrapping_add(8);
+            if !in_group {
+                // Check if this person is a valid hostile target
+                if *ebx.add(0x18) == 1 {  // type == PERSON
+                    let has_weapon = *(ebx.add(0x44) as *const u16) != 0;
+                    let is_faction = (*ebx.add(0x1c) & 0x2) != 0;
+                    if has_weapon || is_faction {
+                        let flags_a = *(ebx.add(0xa) as *const u16);
+                        if (flags_a & 0x109) == 0 {   // not dead/inactive
+                            let following = *(ebx.add(0x20) as *const u16);
+                            if following == 0 {
+                                let result = i_can_see_and_shoot_person(
+                                    entity,
+                                    ebx,
+                                    perception,
+                                );
+                                if result == ebx {
+                                    return ebx;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            ebx = ebx.add(0x5c);
+            si = si.wrapping_add(1);
+            if ebx >= LAST_PERSON {
+                break;
+            }
+        }
+        std::ptr::null_mut()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x34030  fn_S_PERSON_BEING_PERSUADED
+//
+// Target of a persuasion attempt: play animation; when it ends, yield.
+// ---------------------------------------------------------------------------
+pub fn fn_s_person_being_persuaded(entity: *mut u8) {
+    use crate::syndre::funcs_20000::animate_model;
+    unsafe {
+        let ebx = entity;
+        *ebx.add(0x54) = 0;
+        let done = animate_model(ebx);
+        if done != 0 {
+            new_state_person(ebx);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x33b80  fn_S_PERSON_WAIT_TO_CROSS_ROAD
+//
+// Stands at a road crossing until check_for_on_coming_cars returns clear,
+// then calls new_state_person. Always calls affect_person.
+// ---------------------------------------------------------------------------
+pub fn fn_s_person_wait_to_cross_road(entity: *mut u8) {
+    unsafe {
+        let ebx = entity;
+        let angle_idx = *ebx.add(0x1a) as usize;
+        let spd_i32 = 0x100_i32; // shl $0x8 then sar $0x8 → identity but keeps precision
+
+        // Compute projected position using sin/cos tables at current angle
+        let sin_val = *(DATA_5AB60.as_ptr().add(angle_idx * 2) as *const i16) as i32;
+        let cos_val = *(DATA_5AD60.as_ptr().add(angle_idx * 2) as *const i16) as i32;
+        // Assembly multiplies by 0x100 then sars by 8 (net: identity, but
+        // uses the sin/cos table with an integer shift to get tile-scale delta)
+        let tx = (DATA_60B28 as i32).wrapping_add((sin_val.wrapping_mul(spd_i32)) >> 8);
+        let ty = (DATA_60B2A as i32).wrapping_add((cos_val.wrapping_mul(spd_i32)) >> 8);
+        let tz = DATA_60B2C as i32;
+
+        if check_for_on_coming_cars(tx, ty, tz) == 0 {
+            *ebx.add(0xa) = *ebx.add(0xa) & 0xf7;
+            new_state_person(ebx);
+        }
+
+        let new_state = affect_person(ebx) as u8;
+        *ebx.add(0x19) = new_state;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x33c00  fn_S_PERSON_WALK_OFF_ROAD
+//
+// Walk perpendicular to a road until off it. Checks alignment (field_0x5b
+// saves the expected angle), then either transitions back or adjusts angle.
+// ---------------------------------------------------------------------------
+pub fn fn_s_person_walk_off_road(entity: *mut u8) {
+    use crate::syndre::funcs_20000::{animate_model, goto_angle};
+    unsafe {
+        let ebx = entity;
+        *ebx.add(0x54) = 0x20;
+
+        let tx = DATA_60B28 as i32;
+        let ty = DATA_60B2A as i32;
+        let tz = DATA_60B2C as i32 - 1;
+
+        if there_is_a_road_here(tx, ty, tz) == 0 {
+            // Off road: clear flag, switch state
+            *ebx.add(0xa) = *ebx.add(0xa) & 0xf7;
+            new_state_person(ebx);
+        } else {
+            let al = *ebx.add(0x1a);
+            let dy_raw = DATA_60B2A as i32; // dx in asm is actually DATA_60B2A
+            let cx_raw = DATA_60B28 as i32;
+
+            // Depending on heading, check perpendicular clearance and deviation
+            let mut transitioned = false;
+            if al == 0x00 {
+                if dy_raw >= 0x40 {
+                    let saved = *ebx.add(0x5b) as i8;
+                    let diff = ac_abs(0_i32 - saved as i32);
+                    if diff as u8 <= 0x40 {
+                        *ebx.add(0xa) = *ebx.add(0xa) & 0xf7;
+                        new_state_person(ebx);
+                        transitioned = true;
+                    } else {
+                        *ebx.add(0x19) = 0x26; // state = WALK_OFF_ROAD
+                        *ebx.add(0x1a) = (*ebx.add(0x1a)).wrapping_add(0x80);
+                    }
+                }
+            } else if al == 0x40 {
+                if cx_raw >= 0x40 && cx_raw <= 0xc0 {
+                    let saved = *ebx.add(0x5b) as i8;
+                    let diff = ac_abs(0x40_i32 - saved as i32);
+                    if diff as u8 <= 0x40 {
+                        *ebx.add(0xa) = *ebx.add(0xa) & 0xf7;
+                        new_state_person(ebx);
+                        transitioned = true;
+                    } else {
+                        *ebx.add(0x19) = 0x26;
+                        *ebx.add(0x1a) = (*ebx.add(0x1a)).wrapping_add(0x80);
+                    }
+                }
+            } else if al == 0x80 {
+                if cx_raw <= 0xc0 {
+                    let saved = *ebx.add(0x5b) as i8;
+                    let diff = ac_abs(0_i32 - saved as i32);
+                    if diff as u8 <= 0x40 {
+                        *ebx.add(0xa) = *ebx.add(0xa) & 0xf7;
+                        new_state_person(ebx);
+                        transitioned = true;
+                    } else {
+                        *ebx.add(0x19) = 0x26;
+                        *ebx.add(0x1a) = (*ebx.add(0x1a)).wrapping_add(0x80);
+                    }
+                }
+            } else if al == 0xc0 {
+                if cx_raw >= 0x40 && cx_raw <= 0xc0 {
+                    let saved = *ebx.add(0x5b) as i8;
+                    let diff = ac_abs(0x40_i32 - saved as i32);
+                    if diff as u8 <= 0x40 {
+                        *ebx.add(0xa) = *ebx.add(0xa) & 0xf7;
+                        new_state_person(ebx);
+                        transitioned = true;
+                    } else {
+                        *ebx.add(0x19) = 0x26;
+                        *ebx.add(0x1a) = (*ebx.add(0x1a)).wrapping_add(0x80);
+                    }
+                }
+            }
+            let _ = transitioned;
+        }
+
+        let cur_angle = *ebx.add(0x1a);
+        let cur_speed = *ebx.add(0x54);
+        goto_angle(cur_speed as i16, cur_angle);
+
+        if person_colide(ebx) != 0 {
+            quick_decide_on_hug_direction(ebx, 0xa);
+        }
+
+        animate_model(ebx);
+        let new_state = affect_person(ebx) as u8;
+        *ebx.add(0x19) = new_state;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x33dc0  fn_S_PERSON_WAIT_FOR_TRIGGER
+//
+// Waits for an allied person to appear in a 5-column strip at the entity's
+// goto_x/goto_y + field_0x42 row offset. When found, calls new_state_person.
+// Uses field_0x42 as a row counter (0-4 cycling), capped at 5.
+// ---------------------------------------------------------------------------
+pub fn fn_s_person_wait_for_trigger(entity: *mut u8) {
+    unsafe {
+        let ebx = entity;
+        *ebx.add(0x54) = 0;
+
+        // Timer: clamp to [0,5], then increment for next tick
+        let dx = *(ebx.add(0x42) as *const i16);
+        if dx > 5 || dx < 0 {
+            *(ebx.add(0x42) as *mut i16) = 0;
+        } else {
+            *(ebx.add(0x42) as *mut i16) = dx.wrapping_add(1);
+        }
+
+        if !LEVEL_MAPWHO.is_null() {
+            let row_off = *(ebx.add(0x42) as *const i16) as i32;
+            let goto_y = *(ebx.add(0x30) as *const i16) as i32;
+            let goto_x = *(ebx.add(0x2e) as *const i16) as i32;
+            let trigger_z = *(ebx.add(0x32) as *const i16);
+
+            'scan: for cx in 0i32..5 {
+                let tile_idx = (goto_x + cx) + (goto_y + row_off) * 128;
+                if tile_idx < 0 { continue; }
+                let mut ax = *(LEVEL_MAPWHO.add(tile_idx as usize * 2) as *const u16) as usize;
+                loop {
+                    if ax == 0 { break; }
+                    let thing = LEVEL_THINGS_BASE.add(ax);
+                    if *thing.add(0x18) == 1 && (*thing.add(0x1c) & 0x2) != 0 {
+                        let tz = *(thing.add(0x8) as *const i16);
+                        if tz == trigger_z {
+                            new_state_person(ebx);
+                            break 'scan;
+                        }
+                    }
+                    ax = *(thing.add(0x0) as *const u16) as usize;
+                }
+            }
+        }
+
+        let new_state = affect_person(ebx) as u8;
+        *ebx.add(0x19) = new_state;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x33e60  fn_S_PERSON_WAIT_FOR_TRAIN
+//
+// Look for a stopped vehicle (type 2, state 0x9 or 0xa) in the mapwho tile
+// ahead of the entity. If found and has room, board it. Otherwise countdown
+// timer (field_0x42); at zero flip angle and new_state_person.
+// ---------------------------------------------------------------------------
+pub fn fn_s_person_wait_for_train(entity: *mut u8) {
+    unsafe {
+        let esi = entity;
+        *esi.add(0x54) = 0;
+
+        // Compute tile ahead using sin/cos of current angle
+        let angle_idx = *esi.add(0x1a) as usize;
+        let ey = *(esi.add(0x6) as *const i16) as i32;
+        let ex = *(esi.add(0x4) as *const i16) as i32;
+        let sin_val = *(DATA_5AB60.as_ptr().add(angle_idx * 2) as *const i16) as i32;
+        let cos_val = *(DATA_5AD60.as_ptr().add(angle_idx * 2) as *const i16) as i32;
+        // asm: shl $0x8 then sar $0x8 → effectively shifts by 256 then right 8 = identity
+        let nx = ex.wrapping_add(sin_val) & 0x7f00;
+        let ny_masked = (ey.wrapping_add(cos_val)) & 0x7f00;
+        let tile_x = (nx >> 8) & 0x7f;
+        let tile_y = (ny_masked >> 1) & !0x7f | ((ny_masked >> 8) & 0x7f);
+        // Simplified: use same mapwho index calculation as elsewhere
+        let tile_y2 = ((ey.wrapping_add(cos_val)) >> 8) & 0x7f;
+        let tile_x2 = ((ex.wrapping_add(sin_val)) >> 8) & 0x7f;
+        let mapwho_idx = tile_y2 * 128 + tile_x2;
+        let _ = (tile_x, tile_y); // suppress unused
+
+        let mut found_vehicle = false;
+        if !LEVEL_MAPWHO.is_null() && mapwho_idx >= 0 {
+            let mut ax = *(LEVEL_MAPWHO.add(mapwho_idx as usize * 2) as *const u16) as usize;
+            'outer: loop {
+                if ax == 0 { break; }
+                let ebx = LEVEL_THINGS_BASE.add(ax);
+                if *ebx.add(0x18) == 2 {  // type == VEHICLE
+                    let vstate = *ebx.add(0x19);
+                    if vstate == 0x9 || vstate == 0xa {
+                        // Walk forward pointer chain (field_0x20) to find last passenger slot
+                        let mut veh = ebx;
+                        let mut dx2 = *(veh.add(0x20) as *const u16);
+                        if dx2 != 0 {
+                            loop {
+                                let next = LEVEL_THINGS_BASE.add(dx2 as usize);
+                                let nd = *(next.add(0x20) as *const u16);
+                                if nd == 0 { veh = next; break; }
+                                dx2 = nd;
+                                veh = next;
+                            }
+                        }
+                        // Check if last vehicle slot has field_0x1c == 0 (free slot)
+                        let cx = *(veh.add(0x1c) as *const u16);
+                        if cx != 0 {
+                            let cx_thing = LEVEL_THINGS_BASE.add(cx as usize);
+                            if *cx_thing.add(0x19) == 0x2a { break 'outer; }
+                        }
+                        // Board the vehicle
+                        let veh_off = (ebx as usize).wrapping_sub(LEVEL_THINGS_BASE as usize) as u16;
+                        *esi.add(0x58) = 0x6;  // desired = MOVE_INTO_VEHICLE
+                        *(esi.add(0x2c) as *mut u16) = veh_off;
+                        new_state_person(esi);
+                        found_vehicle = true;
+                        break;
+                    }
+                }
+                ax = *(ebx.add(0x0) as *const u16) as usize;
+            }
+        }
+
+        if !found_vehicle {
+            // Countdown timer; at zero: flip angle and give up
+            let timer = *(esi.add(0x42) as *const i16);
+            let new_timer = timer.wrapping_sub(1);
+            *(esi.add(0x42) as *mut i16) = new_timer;
+            if timer == 0 {
+                let ah = *esi.add(0x1a);
+                *esi.add(0x1a) = ah.wrapping_add(0x80);
+                new_state_person(esi);
+            }
+        }
+
+        let new_state = affect_person(esi) as u8;
+        *esi.add(0x19) = new_state;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x33f70  fn_S_PERSON_ALLOW_PASSENGERS
+//
+// Vehicle crew waits while passengers board. Counts down field_0x2c (max
+// 0x1f4); when it expires or was zero, switch to state 0xd (WAIT_FOR_VEH).
+// ---------------------------------------------------------------------------
+pub fn fn_s_person_allow_passengers(entity: *mut u8) {
+    unsafe {
+        let ebx = entity;
+        *ebx.add(0x54) = 0;
+
+        let dx = *(ebx.add(0x2c) as *const u16);
+        if dx == 0 || dx > 0x1f4 {
+            *(ebx.add(0x2c) as *mut u16) = 0x32;
+            *ebx.add(0x19) = 0xd; // WAIT_FOR_VEHICLE
+        } else {
+            *(ebx.add(0x2c) as *mut u16) = dx.wrapping_sub(1);
+        }
+
+        let new_state = affect_person(ebx) as u8;
+        *ebx.add(0x19) = new_state;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x33fb0  fn_S_PERSON_USE_WEAPON
+//
+// Fire animation state. Clears field_0xa bit3, calls affect_person; if state
+// changed, return immediately. Otherwise animate, and when done:
+// call auto_weapon; if it returns non-zero, end via new_state_person +
+// set DATA_5E12C=1; else set field_0xa bit3 (continue firing).
+// ---------------------------------------------------------------------------
+pub fn fn_s_person_use_weapon(entity: *mut u8) {
+    use crate::syndre::funcs_20000::animate_model;
+    unsafe {
+        let ebx = entity;
+        *ebx.add(0x54) = 0;
+        *ebx.add(0xa) = *ebx.add(0xa) & 0xf7; // clear bit 3
+
+        let affect_result = affect_person(ebx) as u16 & 0xffff;
+        let cur_state = *ebx.add(0x19) as u16;
+        if cur_state != affect_result {
+            *ebx.add(0x19) = affect_result as u8;
+            return;
+        }
+
+        let anim_done = animate_model(ebx);
+        if anim_done != 0 || auto_weapon(ebx) != 0 {
+            which_frame_person(ebx);
+            new_state_person(ebx);
+            DATA_5E12C = 1;
+        } else {
+            *ebx.add(0xa) |= 0x08;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x34110  move_people
+//
+// Per-tick simulation loop over all LEVEL_PEOPLE entries. Calls person_intel
+// first, then for each active person: saves coords to DATA_60B28/2A/2C,
+// runs person_on_block + optional adjust_bar_levels, dispatches the person's
+// FSM state (field_0x19) via a match (originally a vtable), then runs the
+// common epilogue: person_danger, danger counter decrement, weapon_is_empty
+// check, and which_frame_person if DATA_5E12C == 0.
+// ---------------------------------------------------------------------------
+pub fn move_people_impl() {
+    unsafe {
+        person_intel();
+        DATA_55300 = 0;
+
+        let mut ebx = LEVEL_PEOPLE;
+        if ebx.is_null() || ebx >= LAST_PERSON {
+            return;
+        }
+
+        loop {
+            DATA_5E12C = 0;
+
+            if *ebx.add(0x18) != 0 {
+                // Save entity coords to per-tick accumulators
+                DATA_60B28 = *(ebx.add(0x4) as *const i16);
+                DATA_60B2A = *(ebx.add(0x6) as *const i16);
+                DATA_60B2C = *(ebx.add(0x8) as *const i16);
+
+                person_on_block(ebx);
+
+                if (*ebx.add(0x1c) & 0x2) != 0 {
+                    adjust_bar_levels(ebx);
+                }
+
+                let fsm = *ebx.add(0x19);
+                if fsm <= 0x2c {
+                    match fsm {
+                        0x00 => { *ebx.add(0x1d) &= 0xf7; fn_s_person_stand(ebx); }
+                        0x01 => { *ebx.add(0x1d) &= 0xf7; fn_s_person_next_command(ebx); }
+                        0x02 | 0x03 => { *ebx.add(0x1d) &= 0xf7; fn_s_person_goto_point(ebx); }
+                        0x04 | 0x05 => {
+                            if *(ebx.add(0x20) as *const u16) != 0 {
+                                *ebx.add(0x1d) |= 0x08;
+                            } else {
+                                *ebx.add(0x1d) &= 0xf7;
+                            }
+                            fn_s_person_goto_structure(ebx);
+                        }
+                        0x06 => { *ebx.add(0x1d) |= 0x08;  fn_s_person_move_into_vehicle(ebx); }
+                        0x07 => { *ebx.add(0x1d) &= 0xf7; fn_s_person_move_out_of_vehicle(ebx); }
+                        0x08 => { *ebx.add(0x1d) &= 0xf7; fn_s_person_passenger(ebx); }
+                        0x09 => { *ebx.add(0x1d) &= 0xf7; fn_s_person_pickup_weapon(ebx); }
+                        0x0a => { *ebx.add(0x1d) &= 0xf7; fn_s_person_drop_weapon(ebx); }
+                        0x0b => { *ebx.add(0x1d) &= 0xf7; fn_s_person_select_weapon(ebx); }
+                        0x0c => { *ebx.add(0x1d) &= 0xf7; fn_s_person_wait_for_model(ebx); }
+                        0x0d => { *ebx.add(0x1d) &= 0xf7; fn_s_person_wait_for_time(ebx); }
+                        0x0e => { fn_s_person_hug_right(ebx); }
+                        0x0f => { fn_s_person_hug_left(ebx); }
+                        0x10 => { *ebx.add(0x1d) &= 0xf7; } // no FSM call
+                        0x11 => { *ebx.add(0x1d) |= 0x08;  fn_s_person_hit_by_laser(ebx); }
+                        0x12 => { *ebx.add(0x1d) |= 0x08;  fn_s_person_hit_by_bullet(ebx); }
+                        0x13 => { *ebx.add(0x1d) |= 0x08;  fn_s_person_hit_by_vehicle(ebx); }
+                        0x14 => { *ebx.add(0x1d) |= 0x08;  fn_s_person_hit_by_fire(ebx); }
+                        0x15 => { *ebx.add(0x1d) |= 0x08;  fn_s_person_hit_by_explosion(ebx); }
+                        0x16 => { *ebx.add(0x1d) |= 0x08;  fn_s_person_fly_back(ebx); }
+                        0x17 => { *ebx.add(0x1d) |= 0x08;  fn_s_person_on_fire(ebx); }
+                        0x18 => { *ebx.add(0x1d) &= 0xf7; fn_s_person_dying(ebx); }
+                        0x19 => { *ebx.add(0x1d) &= 0xf7; fn_s_person_dying_on_fire(ebx); }
+                        0x1a => { *ebx.add(0x1d) &= 0xf7; fn_s_person_dead(ebx); }
+                        0x1b => { *ebx.add(0x1d) &= 0xf7; fn_s_person_dead_on_fire(ebx); }
+                        0x1c => { *ebx.add(0x1d) &= 0xf7; fn_s_person_guard_area(ebx); }
+                        0x1d => { *ebx.add(0x1d) &= 0xf7; fn_s_person_wander(ebx); }
+                        0x1e => { *ebx.add(0x1d) |= 0x08;  fn_s_person_persuaded(ebx); }
+                        0x1f => { *ebx.add(0x1d) |= 0x08;  fn_s_person_runaway(ebx); }
+                        0x20 => { *ebx.add(0x1d) |= 0x08;  fn_s_person_follow_and_attack(ebx); }
+                        0x21 => { *ebx.add(0x1d) &= 0xf7; fn_s_person_drown(ebx); }
+                        0x22 => { *ebx.add(0x1d) |= 0x08;  fn_s_person_give_warning(ebx); }
+                        0x23..=0x25 => { *ebx.add(0x1d) &= 0xf7; } // reserved, no call
+                        0x26 => { *ebx.add(0x1d) &= 0xf7; fn_s_person_wait_to_cross_road(ebx); }
+                        0x27 => { *ebx.add(0x1d) &= 0xf7; fn_s_person_walk_off_road(ebx); }
+                        0x28 => { *ebx.add(0x1d) &= 0xf7; fn_s_person_wait_for_trigger(ebx); }
+                        0x29 => { *ebx.add(0x1d) &= 0xf7; fn_s_person_wait_for_train(ebx); }
+                        0x2a => { *ebx.add(0x1d) &= 0xf7; fn_s_person_allow_passengers(ebx); }
+                        0x2b => { fn_s_person_use_weapon(ebx); }
+                        0x2c => { fn_s_person_being_persuaded(ebx); }
+                        _ => {}
+                    }
+                }
+
+                // Common epilogue: danger counter, weapon check, animation frame
+                person_danger(ebx);
+                let dl = *ebx.add(0x46);
+                if dl > 0 {
+                    *ebx.add(0x46) = dl - 1;
+                }
+                if (*ebx.add(0x1c) & 0x2) != 0 && weapon_is_empty(ebx) != 0 {
+                    *ebx.add(0x46) = 0;
+                }
+                if DATA_5E12C == 0 {
+                    which_frame_person(ebx);
+                }
+            }
+
+            ebx = ebx.add(0x5c);
+            if ebx >= LAST_PERSON {
+                break;
+            }
         }
     }
 }

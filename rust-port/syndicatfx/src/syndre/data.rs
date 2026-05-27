@@ -97,6 +97,10 @@ pub static WEAPON_MAX_AMMO: [u16; 10] = [
     0x001d, // type 9: scanner     29
 ];
 
+// ---- Fatal weapon rating table (data at 0x5a686; byte per weapon type 0-9) -
+// Returned by fatal_weapon(); nonzero = weapon is considered "lethal" for AI.
+pub static DATA_5A686: [u8; 10] = [0x00, 0x00, 0x01, 0x09, 0x02, 0x03, 0x08, 0x01, 0x07, 0x05];
+
 // ---- Weapon detection range table (data at 0x5a6c2; u16 per weapon type) ---
 // Indexed as DATA_5A6C2[weapon_type]; values are fixed-point distances (>> 8).
 pub static DATA_5A6C2: [u16; 20] = [
@@ -205,6 +209,7 @@ pub static mut THING_DRAWLIST: [u8; 16 * 1024] = [0u8; 16 * 1024];
 pub static mut DATA_5E122: u16 = 0;
 pub static mut DATA_5E124: u16 = 0;
 pub static mut DATA_5E128: i16 = 0; // z-displacement added to DATA_60B2C in hug moves
+pub static mut DATA_5E12C: u16 = 0; // set to 1 by USE_WEAPON to suppress which_frame_person
 pub static mut DATA_5E12E: i16 = 0; // perception range arg for agent_check_arc_for_enemy
 pub static mut DATA_5E110: u16 = 0;
 pub static mut DATA_5E112: u16 = 0;

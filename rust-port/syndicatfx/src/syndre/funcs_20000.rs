@@ -7,6 +7,7 @@
 use crate::globals::*;
 use crate::syndre::data::*;
 use crate::syndre::{sar, idiv32};
+use crate::syndre::funcs_10000::set_all_changes;
 use bflibrary::screen::LB_DISPLAY;
 
 // ---- Forward declarations of untranslated functions in this range -----------
@@ -15,9 +16,7 @@ extern "C" {
     fn process_action(slot: u32);
     fn ExchangeNetwork_Packet();
     fn NetworkPlayersCount() -> u16;
-    fn set_all_changes();
     fn func_4f3d2(slot: i32, font: *mut u8, row: i32, col: i32, unk: i32, unk2: i32);
-    fn load_map_level(fname: *const u8, levno: u32);
     fn init_players_people(slot: u32, unk: u32);
     fn setup_panel();
     fn set_network_player(slot: u32, unk: u32);
@@ -28,6 +27,12 @@ extern "C" {
     fn StopNetwork(slot: u32);
     fn StopAllSounds();
     fn LbDataFreeAll(files: *mut u8);
+    fn clear_savegame();
+    fn LbFileReadRNC(fname: *const u8, seed: *mut u16) -> i32;
+    fn ac_LbDataLoadAll(files: *mut u8) -> i32;
+    fn ac_sound_bank_setup();
+    fn init_hires_blocks();
+    fn init_level_data();
     fn GetTeamMemberName() -> u8;
     fn DoResearch() -> u8;
     fn CompleteResearch();
@@ -968,5 +973,144 @@ pub fn move_mapwho(entity: *mut u8, mut new_x: i16, mut new_y: i16, new_z: i16) 
         *(entity.add(4) as *mut i16) = new_x;
         *(entity.add(6) as *mut i16) = new_y;
         *(entity.add(8) as *mut i16) = new_z;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x252b0  load_map_level
+//
+// Loads a mission level. Formats the level number as two decimal digits into
+// the filename buffer at offsets 9 and 10. Depending on DRAW_FLAGS:
+//   == 2 (VRES16): sets VSCREEN/USCREEN/BSCREEN, reads the .RNC file into
+//        LEVEL_SEED, patches the map number into MISSION_LOAD_FILES[1].FName,
+//        loads the data files, optionally loads the sound bank, then calls
+//        init_hires_blocks.
+//   == 4 (UNKN04): reads the .RNC file, loads unkn1_empty_load_files.
+// Always calls init_level_data at the end.
+//
+// Literal translation: two idiv-by-10 pairs (one for levno, one for mapno),
+// raw byte writes into the MISSION_LOAD_FILES data block at byte offsets
+// 0x34/0x35 (= mission_load_files[1].FName[8..9] with struct stride 0x2c).
+// ---------------------------------------------------------------------------
+pub fn load_map_level(fname: *mut u8, levno: u16) {
+    unsafe {
+        clear_savegame();
+        CURRENT_LEVNO = levno;
+        let levno_u32 = levno as u32;
+        *fname.add(9)  = (levno_u32 / 10) as u8 + b'0';
+        *fname.add(10) = (levno_u32 % 10) as u8 + b'0';
+
+        if DRAW_FLAGS == DRW_F_SCREEN_VRES16 {
+            VSCREEN = VGA_BUFFER.add(0x6400);
+            USCREEN = WSCREEN.add(0x1f408);
+            BSCREEN = WSCREEN.add(0x1f418);
+            LbFileReadRNC(fname, std::ptr::addr_of_mut!(LEVEL_SEED));
+            if LEVEL_MAP_NUMBER == 0 { LEVEL_MAP_NUMBER = 1; }
+            let mapno = LEVEL_MAP_NUMBER as u32;
+            *MISSION_LOAD_FILES.add(0x34) = (mapno / 10) as u8 + b'0';
+            *MISSION_LOAD_FILES.add(0x35) = (mapno % 10) as u8 + b'0';
+            ac_LbDataLoadAll(MISSION_LOAD_FILES);
+            if bfsoundlib::audio::GetSoundAble() {
+                ac_LbDataLoadAll(SOUND_BANK_FILES0);
+                ac_sound_bank_setup();
+            }
+            init_hires_blocks();
+        }
+
+        if DRAW_FLAGS == DRW_F_UNKN04 {
+            LbFileReadRNC(fname, std::ptr::addr_of_mut!(LEVEL_SEED));
+            if LEVEL_MAP_NUMBER == 0 { LEVEL_MAP_NUMBER = 1; }
+            ac_LbDataLoadAll(UNK1_EMPTY_LOAD_FILES);
+        }
+
+        init_level_data();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x253f0  init_effect
+//
+// Finds the first free slot in level__Effects (stride 0x1e, up to
+// level__Commands) where field_0x18 == 0, writes x/y/z, sets type=3,
+// links into the mapwho grid, and returns the slot pointer.
+// Returns null if no free slot.
+//
+// Literal: pointer walks from LEVEL_EFFECTS to LEVEL_COMMANDS by 0x1e.
+// ---------------------------------------------------------------------------
+pub fn init_effect(x: i16, y: i16, z: i16) -> *mut u8 {
+    unsafe {
+        if LEVEL_EFFECTS.is_null() || LEVEL_COMMANDS.is_null() { return std::ptr::null_mut(); }
+        let mut ebx = LEVEL_EFFECTS;
+        while (ebx as usize) < (LEVEL_COMMANDS as usize) {
+            if *ebx.add(0x18) == 0 {
+                *(ebx.add(0x4) as *mut i16) = x;
+                *(ebx.add(0x6) as *mut i16) = y;
+                *(ebx.add(0x8) as *mut i16) = z;
+                *ebx.add(0x18) = 3;
+                *(ebx.add(0xa) as *mut u16) = 0;
+                *(ebx.add(0x10) as *mut u16) = 0;
+                *(ebx.add(0x12) as *mut u16) = 0xffff;
+                move_on_mapwho(ebx, x, y, z);
+                return ebx;
+            }
+            ebx = ebx.add(0x1e);
+        }
+        std::ptr::null_mut()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x25460  init_weapon
+//
+// Finds first free weapon slot (field_0x18 == 0 or >= 6) in
+// level__Weapons (stride 0x24, up to level__Effects), zeroes it,
+// writes x/y/z, sets type=4, links into mapwho. Returns slot ptr or null.
+//
+// Literal: pointer walks LEVEL_WEAPONS to LEVEL_EFFECTS by 0x24;
+// ac_LbMemorySet(slot, 0, 0x24) replaced by write_bytes.
+// ---------------------------------------------------------------------------
+pub fn init_weapon(x: i16, y: i16, z: i16) -> *mut u8 {
+    unsafe {
+        if LEVEL_WEAPONS.is_null() || LEVEL_EFFECTS.is_null() { return std::ptr::null_mut(); }
+        let mut ebx = LEVEL_WEAPONS;
+        while (ebx as usize) < (LEVEL_EFFECTS as usize) {
+            let typ = *ebx.add(0x18);
+            if typ == 0 || typ >= 6 {
+                ebx.write_bytes(0, 0x24);
+                *(ebx.add(0x4) as *mut i16) = x;
+                *(ebx.add(0x6) as *mut i16) = y;
+                *(ebx.add(0x8) as *mut i16) = z;
+                *ebx.add(0x18) = 4;
+                move_on_mapwho(ebx, x, y, z);
+                return ebx;
+            }
+            ebx = ebx.add(0x24);
+        }
+        std::ptr::null_mut()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x254d0  new_weapon
+//
+// Like init_weapon but only zeroes the slot; does NOT set x/y/z or type,
+// and does NOT call move_on_mapwho. Used when caller will fill the slot.
+// Returns slot ptr or null (same free-slot criterion as init_weapon).
+//
+// Literal: same loop body as init_weapon minus the field writes.
+// ---------------------------------------------------------------------------
+pub fn new_weapon() -> *mut u8 {
+    unsafe {
+        if LEVEL_WEAPONS.is_null() || LEVEL_EFFECTS.is_null() { return std::ptr::null_mut(); }
+        let mut ebx = LEVEL_WEAPONS;
+        while (ebx as usize) < (LEVEL_EFFECTS as usize) {
+            let typ = *ebx.add(0x18);
+            if typ == 0 || typ >= 6 {
+                ebx.write_bytes(0, 0x24);
+                return ebx;
+            }
+            ebx = ebx.add(0x24);
+        }
+        std::ptr::null_mut()
     }
 }

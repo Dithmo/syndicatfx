@@ -118,8 +118,15 @@ pub static mut DATA_9BC72: i16 = 0;
 pub static mut LEVEL_WORLDS: i16 = 0; // level__Worlds
 
 // ---- Level entity pointers --------------------------------------------------
+// Subarray pointers into the level data block; set by init_level_data.
+// Strides: People=0x34, Vehicles=?, Objects=?, Weapons=0x24, Effects=0x1e.
 pub static mut LEVEL_THINGS_BASE: *mut u8 = std::ptr::null_mut();
 pub static mut LEVEL_PEOPLE:      *mut u8 = std::ptr::null_mut();
+pub static mut LEVEL_VEHICLES:    *mut u8 = std::ptr::null_mut();
+pub static mut LEVEL_OBJECTS:     *mut u8 = std::ptr::null_mut();
+pub static mut LEVEL_WEAPONS:     *mut u8 = std::ptr::null_mut();
+pub static mut LEVEL_EFFECTS:     *mut u8 = std::ptr::null_mut();
+pub static mut LEVEL_COMMANDS:    *mut u8 = std::ptr::null_mut();
 pub static mut LEVEL_MAPWHO:      *mut u8 = std::ptr::null_mut();
 pub static mut LEVEL_TIMER:       u16 = 0;
 pub static mut LEVEL_PERSON_COUNT: u16 = 0; // level__PersonCount_UNSURE

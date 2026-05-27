@@ -213,7 +213,7 @@ fn asl_mul_slot(n: u32) -> u32 {
 
 /// Compute horizontal distance (used for proximity checks).
 /// Original: getrdist(dx: i16, dz: i16) — likely sqrt(dx²+dz²) or a table lookup.
-fn getrdist(dx: i16, dz: i16) -> u32 {
+pub fn getrdist(dx: i16, dz: i16) -> u32 {
     let x = (dx as i32).unsigned_abs();
     let z = (dz as i32).unsigned_abs();
     x + z // Manhattan distance (exact algorithm TBD from full getrdist translation)

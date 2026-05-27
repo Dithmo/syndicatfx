@@ -25,6 +25,8 @@ pub const DRW_F_UNKN04:        u8 = 0x4;
 pub static mut VGA_BUFFER:      *mut u8 = std::ptr::null_mut();
 pub static mut WSCREEN:         *mut u8 = std::ptr::null_mut();
 pub static mut VSCREEN:         *mut u8 = std::ptr::null_mut();
+pub static mut USCREEN:         *mut u8 = std::ptr::null_mut();
+pub static mut BSCREEN:         *mut u8 = std::ptr::null_mut();
 pub static mut GRAPHICS_PALETTE:*mut u8 = std::ptr::null_mut();
 
 // Scaled mouse coordinates exposed to ASM game logic

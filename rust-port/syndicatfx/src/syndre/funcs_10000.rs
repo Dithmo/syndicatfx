@@ -872,12 +872,70 @@ fn scroll(dir: u32) {
 }
 
 fn draw_horizontal_and_set_all() {
-    // Calls draw_horizontal() + set_all_changes() — stubs pending translation
     unsafe { DATA_5532C = 0x10; }
+    set_all_changes();
 }
 
 fn draw_vertical_and_set_all() {
     unsafe { DATA_5532C = 0x10; }
+    set_all_changes();
+}
+
+// ---------------------------------------------------------------------------
+// 0x1d180  set_all_changes
+//
+// Marks every cell of the 25×16 dirty-tile grid (DATA_5DB2C) as changed (=1)
+// and sets the full-redraw flag DATA_60B4F = 1.
+// ---------------------------------------------------------------------------
+pub fn set_all_changes() {
+    unsafe {
+        for row in 0usize..0x19 {
+            for col in 0usize..0x10 {
+                DATA_5DB2C[row * 0x10 + col] = 1;
+            }
+        }
+        DATA_60B4F = 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x1d1d0  set_block_changes
+//
+// Marks a rectangular block of the dirty-tile grid (DATA_5DB2C) as changed
+// (value = 3). Arguments are screen pixel coordinates; converted to tile
+// indices by subtracting 128 and shifting right (x÷32, y÷16).
+//
+// Structural translation: bounds checking and clamping match the original
+// control flow faithfully.
+// ---------------------------------------------------------------------------
+pub fn set_block_changes(arg1: i16, arg2: i16, arg3: i16, arg4: i16) {
+    use crate::syndre::sar;
+    unsafe {
+        // Convert screen coords to tile indices
+        let col_start = sar((arg1 as i32 - 0x80) as u32, 5) as i32;
+        let col_end   = sar((arg3 as i32 - 0x80) as u32, 5) as i32;
+        let row_start = sar(arg2 as i32 as u32, 4) as i32;
+        let row_end   = sar(arg4 as i32 as u32, 4) as i32;
+
+        // Bounds check — any coord fully out of range → skip
+        if row_end < 0 || row_start >= 0x19 || col_start >= 0x10 || col_end < 0 {
+            return;
+        }
+
+        // Clamp to grid extents
+        let r_start = row_start.max(0) as usize;
+        let r_end   = row_end.min(0x18) as usize;
+        let c_start = col_start.max(0) as usize;
+        let c_end   = col_end.min(0xf) as usize;
+
+        if c_start > c_end { return; }
+
+        for col in c_start..=c_end {
+            for row in r_start..=r_end {
+                DATA_5DB2C[row * 0x10 + col] = 3;
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

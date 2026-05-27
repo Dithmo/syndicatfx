@@ -83,6 +83,20 @@ pub static mut DATA_5E5BA: [u8;  8448] = [0u8;  8448]; // agent flags (u16 via r
 pub static mut DATA_5E5BC: [u8;  8448] = [0u8;  8448]; // gender (u16 via raw ptr)
 pub static mut DATA_5E5C0: [u8;  8448] = [0u8;  8448]; // team assignment
 
+// ---- Weapon ammo caps (data at 0x5a73a; indexed by weapon type, u16 each) -
+pub static WEAPON_MAX_AMMO: [u16; 10] = [
+    0x0000, // type 0: none
+    0x0032, // type 1: pistol      50
+    0x000c, // type 2: shotgun     12
+    0x0002, // type 3: uzi          2
+    0x000b, // type 4: minigun     11
+    0x0031, // type 5: laser       49
+    0x01f3, // type 6: gauss      499
+    0x0004, // type 7: flamer       4
+    0x03e7, // type 8: long-range 999
+    0x001d, // type 9: scanner     29
+];
+
 // ---- Player credits (EXPORT_SYMBOL(players)) ----------------------------
 pub static mut PLAYERS: [u32; 8] = [0u32; 8];
 pub static mut SELECTED_TEAM: [u8; 8] = [0u8; 8];

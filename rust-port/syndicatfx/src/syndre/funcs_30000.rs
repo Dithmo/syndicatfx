@@ -18,6 +18,7 @@ extern "C" {
     fn person_goto(entity: *mut u8);
     fn person_colide(entity: *mut u8) -> u16;
     fn decide_on_hug_direction(entity: *mut u8, speed: u32);
+    fn drop_weapon(entity: *mut u8);
 }
 
 // ---------------------------------------------------------------------------
@@ -654,5 +655,586 @@ pub fn who_shot_me(victim: *mut u8) {
                 *edx.add(0x1c) |= 0x40;
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x321c0  fn_S_PERSON_GOTO_STRUCTURE
+//
+// Walk to a target structure or vehicle. If the target entity is dead (field_0xb
+// bit 0), relinquish control via new_state_person. If the agent is following
+// a vehicle (field_0x58 == 6, follow-target without its own vehicle), also
+// relinquish. Otherwise copy target's xyz into entity.field_0x2e/30/32 and
+// either finish via new_state_person (arrived), delegate to person_goto_in_vehicle,
+// or walk/hug-wall on foot.
+//
+// Literal translation of 0x321c0–0x322f3.
+// ---------------------------------------------------------------------------
+pub fn fn_s_person_goto_structure(entity: *mut u8) {
+    use crate::syndre::data::{LEVEL_THINGS_BASE, DATA_60B28, DATA_60B2A, DATA_60B2C};
+    use crate::syndre::funcs_20000::{move_mapwho, animate_model, getdist};
+    unsafe {
+        let eax_link = *(entity.add(0x2c) as *const u16) as usize;
+        let target = LEVEL_THINGS_BASE.add(eax_link);
+
+        if (*target.add(0x0b) & 0x1) != 0 {
+            let al = *entity.add(0x19);
+            *entity.add(0x58) = al;
+            new_state_person(entity);
+            return;
+        }
+
+        let follow_link = *(entity.add(0x20) as *const u16);
+        if follow_link != 0 && *entity.add(0x58) == 6 {
+            let follow = LEVEL_THINGS_BASE.add(follow_link as usize);
+            if *(follow.add(0x24) as *const u16) == 0 {
+                let al = *entity.add(0x19);
+                *entity.add(0x58) = al;
+                new_state_person(entity);
+                return;
+            }
+        }
+
+        // Copy target x/y/z to entity goto fields
+        let tx = *(target.add(0x4) as *const u16);
+        let ty = *(target.add(0x6) as *const u16);
+        let tz = *(target.add(0x8) as *const u16);
+        *(entity.add(0x2e) as *mut u16) = tx;
+        *(entity.add(0x30) as *mut u16) = ty;
+        *(entity.add(0x32) as *mut u16) = tz;
+
+        if *target.add(0x18) == 2 {
+            // Target is a vehicle — check proximity to camera position
+            let dx = (*(entity.add(0x2e) as *const i16) as i32
+                      - DATA_60B28 as i32) as i16;
+            let dy = (*(entity.add(0x30) as *const i16) as i32
+                      - DATA_60B2A as i32) as i16;
+            if getdist(dx, dy) < 0x80 {
+                new_state_person(entity);
+                return;
+            }
+        }
+
+        // In vehicle?
+        let veh_link = *(entity.add(0x24) as *const u16);
+        if veh_link != 0 {
+            let vehicle = LEVEL_THINGS_BASE.add(veh_link as usize);
+            if *vehicle.add(0x18) == 2 {
+                person_goto_in_vehicle(entity, vehicle);
+                move_mapwho(entity,
+                    DATA_60B28 as i16, DATA_60B2A as i16, DATA_60B2C as i16);
+                return;
+            }
+        }
+
+        // Walk on foot
+        person_goto(entity);
+        if person_colide(entity) != 0 {
+            decide_on_hug_direction(entity, 0x1f4);
+        }
+        let new_state = affect_person(entity) as u8;
+        *entity.add(0x19) = new_state;
+        animate_model(entity);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x32300  fn_S_PERSON_MOVE_INTO_VEHICLE
+//
+// Board a vehicle stored in entity.field_0x2c. Checks that the entity is
+// close enough (xy dist < 128, z diff <= 128). Inserts the entity at the end
+// of the vehicle's passenger chain and sets state IN_VEHICLE (8) or delegates
+// via new_state_person when not yet at the vehicle.
+//
+// Literal translation of 0x32300–0x32470.
+// ---------------------------------------------------------------------------
+pub fn fn_s_person_move_into_vehicle(entity: *mut u8) {
+    use crate::syndre::data::LEVEL_THINGS_BASE;
+    use crate::syndre::funcs_20000::{move_mapwho, getdist};
+    unsafe {
+        let esi = entity;
+        let dx_follow = *(esi.add(0x20) as *const u16);
+        *esi.add(0x54) = 0;
+
+        // If following an entity that is already in a vehicle, abort
+        if dx_follow != 0 {
+            let follow = LEVEL_THINGS_BASE.add(dx_follow as usize);
+            if *(follow.add(0x24) as *const u16) != 0 {
+                let al = *esi.add(0x19);
+                *esi.add(0x58) = al;
+                new_state_person(esi);
+                return;
+            }
+        }
+        // Already in a vehicle, abort
+        if *(esi.add(0x24) as *const u16) != 0 {
+            let al = *esi.add(0x19);
+            *esi.add(0x58) = al;
+            new_state_person(esi);
+            return;
+        }
+
+        let veh_link = *(esi.add(0x2c) as *const u16) as usize;
+        let edi = LEVEL_THINGS_BASE.add(veh_link); // target vehicle
+
+        // Horizontal distance check
+        let dy = (*(edi.add(0x6) as *const i16)).wrapping_sub(*(esi.add(0x6) as *const i16));
+        let dx = (*(edi.add(0x4) as *const i16)).wrapping_sub(*(esi.add(0x4) as *const i16));
+        let dist = getdist(dx, dy);
+
+        // Vertical distance check
+        let ez: i32 = *(esi.add(0x8) as *const i16) as i32;
+        let vz: i32 = *(edi.add(0x8) as *const i16) as i32;
+        let zdiff = (ez - vz) as i32;
+        let abs_z = unsafe { ac_abs(zdiff) };
+
+        if dist >= 0x80 || abs_z > 0x80 {
+            // Too far — switch to GOTO_VEHICLE state, desired MOVE_INTO_VEHICLE
+            *esi.add(0x19) = 5;
+            *esi.add(0x58) = 6;
+            return;
+        }
+
+        // Close enough — check vehicle alive
+        if (*edi.add(0x0b) & 0x1) != 0 {
+            let al = *esi.add(0x19);
+            *esi.add(0x58) = al;
+            new_state_person(esi);
+            return;
+        }
+
+        *(esi.add(0x0c) as *mut u16) = 0;
+
+        let first_pass_ax = *(edi.add(0x1c) as *const u16);
+        if first_pass_ax != 0 {
+            // Find last passenger in chain
+            let mut ax = first_pass_ax;
+            let mut ebx = LEVEL_THINGS_BASE.add(ax as usize);
+            loop {
+                ax = *(ebx.add(0x22) as *const u16);
+                if ax == 0 { break; }
+                ebx = LEVEL_THINGS_BASE.add(ax as usize);
+            }
+            // Insert entity after ebx (last passenger)
+            let ebx_off = (ebx as usize).wrapping_sub(LEVEL_THINGS_BASE as usize) as u16;
+            *(esi.add(0x24) as *mut u16) = ebx_off;
+            let esi_off = (esi as usize).wrapping_sub(LEVEL_THINGS_BASE as usize) as u16;
+            *(ebx.add(0x22) as *mut u16) = esi_off;
+            *(esi.add(0x22) as *mut u16) = 0;
+            *esi.add(0x0a) |= 0x8;
+            *esi.add(0x19) = 8;
+        } else {
+            // Vehicle is empty — become first passenger
+            let edi_off = (edi as usize).wrapping_sub(LEVEL_THINGS_BASE as usize) as u16;
+            *(esi.add(0x24) as *mut u16) = edi_off;
+            *(esi.add(0x22) as *mut u16) = 0;
+            let esi_off = (esi as usize).wrapping_sub(LEVEL_THINGS_BASE as usize) as u16;
+            *(edi.add(0x1c) as *mut u16) = esi_off;
+            *(esi.add(0x22) as *mut u16) = 0;
+
+            let dl = *edi.add(0x19);
+            if dl == 9 || dl == 0xa {
+                *esi.add(0x0a) |= 0x8;
+                *esi.add(0x19) = 8;
+            } else {
+                *esi.add(0x55) = *edi.add(0x28);
+                new_state_person(esi);
+                // fall through to common passenger setup
+                *esi.add(0x0a) |= 0x1;
+                *esi.add(0x54) = 0;
+                *(esi.add(0x34) as *mut u16) = *(edi.add(0x4) as *const u16);
+                *(esi.add(0x36) as *mut u16) = *(edi.add(0x6) as *const u16);
+                let ez_val = *(esi.add(0x8) as *const i16) as i32;
+                let vy_val = *(edi.add(0x6) as *const i16) as i32;
+                let vx_val = *(edi.add(0x4) as *const i16) as i32;
+                move_mapwho(esi, vx_val as i16, vy_val as i16, ez_val as i16);
+                return;
+            }
+        }
+
+        // Common passenger finalisation (jump_32434)
+        *esi.add(0x0a) |= 0x1;
+        *esi.add(0x54) = 0;
+        *(esi.add(0x34) as *mut u16) = *(edi.add(0x4) as *const u16);
+        *(esi.add(0x36) as *mut u16) = *(edi.add(0x6) as *const u16);
+        let ez_val = *(esi.add(0x8) as *const i16) as i32;
+        let vy_val = *(edi.add(0x6) as *const i16) as i32;
+        let vx_val = *(edi.add(0x4) as *const i16) as i32;
+        move_mapwho(esi, vx_val as i16, vy_val as i16, ez_val as i16);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x32480  fn_S_PERSON_MOVE_OUT_OF_VEHICLE
+//
+// Remove entity from its vehicle's passenger chain, then call move_mapwho and
+// new_state_person. If entity has no vehicle link, relinquish via new_state.
+//
+// Literal translation of 0x32480–0x32591.
+// ---------------------------------------------------------------------------
+pub fn fn_s_person_move_out_of_vehicle(entity: *mut u8) {
+    use crate::syndre::data::LEVEL_THINGS_BASE;
+    use crate::syndre::funcs_20000::move_mapwho;
+    unsafe {
+        let ebx = entity;
+        let dx = *(ebx.add(0x24) as *const u16);
+        *ebx.add(0x54) = 0;
+
+        if dx == 0 {
+            let al = *ebx.add(0x19);
+            *ebx.add(0x58) = al;
+            new_state_person(ebx);
+            return;
+        }
+
+        let eax = LEVEL_THINGS_BASE.add(dx as usize); // vehicle
+        *(ebx.add(0x0c) as *mut u16) = 0;
+
+        let si = *(ebx.add(0x22) as *const u16); // next passenger link
+        let edx_veh = eax; // vehicle ptr
+
+        if *eax.add(0x18) == 2 {
+            // Vehicle is type 2 — splice from field_0x1c chain
+            if si != 0 {
+                let next_pass = LEVEL_THINGS_BASE.add(si as usize);
+                let cx = *(ebx.add(0x24) as *const u16);
+                *(next_pass.add(0x24) as *mut u16) = cx;
+            }
+            let ax = *(ebx.add(0x22) as *const u16);
+            *(edx_veh.add(0x1c) as *mut u16) = ax;
+        } else {
+            // Non-type-2 — splice from field_0x22 chain
+            let cx = *(ebx.add(0x22) as *const u16);
+            if cx != 0 {
+                let next_pass = LEVEL_THINGS_BASE.add(cx as usize);
+                let cx2 = *(ebx.add(0x24) as *const u16);
+                *(next_pass.add(0x24) as *mut u16) = cx2;
+            }
+            let ax = *(ebx.add(0x22) as *const u16);
+            *(edx_veh.add(0x22) as *mut u16) = ax;
+        }
+
+        // Restore desired command and exit vehicle
+        *ebx.add(0x55) = *ebx.add(0x56);
+        let ex = *(ebx.add(0x8) as *const i16) as i32;
+        let ey = (*(ebx.add(0x6) as *const i16) as i32).wrapping_add(1);
+        let ex2 = (*(ebx.add(0x4) as *const i16) as i32).wrapping_add(1);
+        *(ebx.add(0x24) as *mut u16) = 0;
+        *(ebx.add(0x22) as *mut u16) = 0;
+        let dh = *ebx.add(0x0a) & 0xfe;
+        *ebx.add(0x54) = 0;
+        *ebx.add(0x0a) = dh;
+        move_mapwho(ebx, ex2 as i16, ey as i16, ex as i16);
+        new_state_person(ebx);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x32560  fn_S_PERSON_PASSENGER
+//
+// Keep entity's mapwho position in sync with the vehicle it is riding. If the
+// vehicle has stopped (states 9/0xa) and the entity has a follow-target that
+// could disembark, trigger a new state. Otherwise move_mapwho to the first
+// type-2 vehicle in the chain.
+//
+// Literal translation of 0x32560–0x32761.
+// ---------------------------------------------------------------------------
+pub fn fn_s_person_passenger(entity: *mut u8) {
+    use crate::syndre::data::{LEVEL_THINGS_BASE, DATA_55358};
+    use crate::syndre::funcs_20000::move_mapwho;
+    unsafe {
+        let esi = entity;
+        *esi.add(0x54) = 0;
+
+        let bx_veh = *(esi.add(0x24) as *const u16);
+        let ebx = LEVEL_THINGS_BASE.add(bx_veh as usize); // current vehicle
+        *(esi.add(0x0c) as *mut u16) = 0;
+        let edi = ebx; // save vehicle ptr
+
+        let dx_follow = *(esi.add(0x20) as *const u16);
+        if dx_follow != 0 {
+            let follow = LEVEL_THINGS_BASE.add(dx_follow as usize);
+            if *(follow.add(0x24) as *const u16) == 0 {
+                // Follow target not in vehicle — check map tile under entity
+                let ey_raw = *(esi.add(0x6) as *const i16) as i32;
+                let ex_raw = *(esi.add(0x4) as *const i16) as i32;
+                let ez_raw = *(esi.add(0x8) as *const i16) as i32;
+
+                // Compute tile coords (divide by 0x6000 with signed remainder)
+                let tile_y = {
+                    let r = ey_raw % 0x6000;
+                    if r < 0 { (r + 0x6000) } else { r }
+                } >> 8;
+                let tile_x = ((ex_raw & 0xff00_i32) as i32) >> 8;
+
+                // Look up map: data_55358[tile_y * 128 + tile_x] → type byte
+                let tile_idx = (tile_y as usize).wrapping_mul(128)
+                    .wrapping_add(tile_x as usize);
+                let map_ptr = DATA_55358;
+                if !map_ptr.is_null() {
+                    let tile_base = *(map_ptr.add(tile_idx * 4) as *const u8);
+                    if tile_base != 2 {
+                        *esi.add(0x19) = 7;
+                        *esi.add(0x0a) &= !0x8;
+                        *esi.add(0x58) = 0x1e;
+                        return;
+                    }
+                }
+                let _ = ez_raw; // suppress unused warning
+            }
+        }
+
+        // Check vehicle active and in load/unload states (9/a)
+        if *edi.add(0x18) == 2 {
+            let veh_state = *edi.add(0x19);
+            if veh_state == 9 || veh_state == 0xa {
+                // Vehicle stopped — check if we need to reposition
+                let stored_x = *(esi.add(0x34) as *const u16);
+                let stored_y = *(esi.add(0x36) as *const u16);
+                let veh_x = *(ebx.add(0x4) as *const u16);
+                let veh_y = *(ebx.add(0x6) as *const u16);
+                if stored_x != veh_x || stored_y != veh_y {
+                    // Follow chain to find tail entity
+                    let mut ax = *(ebx.add(0x20) as *const u16);
+                    let mut ecx = edi; // default: vehicle itself
+                    if ax != 0 {
+                        loop {
+                            ecx = LEVEL_THINGS_BASE.add(ax as usize);
+                            ax = *(ecx.add(0x20) as *const u16);
+                            if ax == 0 { break; }
+                        }
+                    }
+
+                    // Tail entity's first passenger (field_0x1c) — check animating
+                    let first_pass_link = *(ecx.add(0x1c) as *const u16);
+                    if first_pass_link != 0 {
+                        let first_pass = LEVEL_THINGS_BASE.add(first_pass_link as usize);
+                        let dh = *first_pass.add(0x54);
+                        if dh == 0 {
+                            // Set entity angle based on lead angle
+                            let bl = *ecx.add(0x1a); // lead vehicle angle
+                            if bl == 0 || bl == 0x80 {
+                                *esi.add(0x1a) = 0x40;
+                            } else {
+                                *esi.add(0x1a) = 0; // dh was 0
+                            }
+                            *esi.add(0x58) = 7;
+                            new_state_person(esi);
+                            return;
+                        }
+                    }
+                }
+                // fall through to 326a0
+            }
+        }
+
+        // 326a0: vehicle not in states 9/a — check for exit
+        if *edi.add(0x18) == 2 {
+            let ch = *edi.add(0x19);
+            if ch != 9 && ch != 0xa {
+                let veh_cmd = *ebx.add(0x28);
+                *esi.add(0x55) = veh_cmd;
+                *esi.add(0x0a) &= !0x8;
+                let al = *esi.add(0x19);
+                *esi.add(0x58) = al;
+                new_state_person(esi);
+                return;
+            }
+        }
+
+        // 326d6: Find first type-2 vehicle in entity's vehicle chain
+        let mut ax = *(esi.add(0x24) as *const u16);
+        let mut ebx_cur = edi;
+        if ax != 0 {
+            loop {
+                ebx_cur = LEVEL_THINGS_BASE.add(ax as usize);
+                if *ebx_cur.add(0x18) == 2 { break; }
+                ax = *(ebx_cur.add(0x24) as *const u16);
+                if ax == 0 { break; }
+            }
+        }
+
+        let vx = *(ebx_cur.add(0x4) as *const i16) as i32;
+        let vy = *(ebx_cur.add(0x6) as *const i16) as i32;
+        let vz = *(ebx_cur.add(0x8) as *const i16) as i32;
+        move_mapwho(esi, vx as i16, vy as i16, vz as i16);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x32720  fn_S_PERSON_PICKUP_WEAPON
+//
+// Pick up the weapon stored in entity.field_0x2c if within reach. Animates
+// the pickup, clamps weapon ammo to WEAPON_MAX_AMMO, inserts weapon into
+// entity's weapon list, and calls new_state_person.
+//
+// Literal translation of 0x32720–0x32864.
+// ---------------------------------------------------------------------------
+pub fn fn_s_person_pickup_weapon(entity: *mut u8) {
+    use crate::syndre::data::{LEVEL_THINGS_BASE, WEAPON_MAX_AMMO};
+    use crate::syndre::funcs_20000::animate_model;
+    unsafe {
+        let esi = entity;
+        let ebx = LEVEL_THINGS_BASE.add(*(esi.add(0x2c) as *const u16) as usize);
+        *esi.add(0x54) = 0;
+
+        // Position check
+        let at_x = *(esi.add(0x4) as *const u16) == *(ebx.add(0x4) as *const u16);
+        let at_y = *(esi.add(0x6) as *const u16) == *(ebx.add(0x6) as *const u16);
+        let ez: i32 = *(esi.add(0x8) as *const i16) as i32;
+        let wz: i32 = *(ebx.add(0x8) as *const i16) as i32;
+        let abs_z = unsafe { ac_abs(ez.wrapping_sub(wz)) };
+
+        if !at_x || !at_y || abs_z > 0x80 {
+            *esi.add(0x19) = 5;
+            *esi.add(0x58) = 9;
+            return;
+        }
+
+        if (*ebx.add(0x0a) & 0x1) != 0 {
+            // Weapon busy — just call new_state
+            new_state_person(esi);
+            return;
+        }
+
+        let anim_done = animate_model(esi);
+        if anim_done == 0 { return; }
+
+        // Clamp ammo
+        let ammo_i16 = *(ebx.add(0x14) as *const i16);
+        *(ebx.add(0x1c) as *mut u16) = 0;
+        if ammo_i16 >= 0 {
+            let wtype = *ebx.add(0x19) as usize;
+            if wtype < WEAPON_MAX_AMMO.len() {
+                let max_ammo = WEAPON_MAX_AMMO[wtype] as i16;
+                if ammo_i16 > max_ammo {
+                    *(ebx.add(0x14) as *mut i16) = max_ammo;
+                }
+            }
+        }
+
+        // Insert weapon into entity's weapon list
+        let weapon_off = (ebx as usize).wrapping_sub(LEVEL_THINGS_BASE as usize) as u16;
+        let ent_off    = (esi as usize).wrapping_sub(LEVEL_THINGS_BASE as usize) as u16;
+
+        let existing = *(esi.add(0x3a) as *const u16);
+        if existing != 0 {
+            // Walk existing weapon chain to find last
+            let mut eax = LEVEL_THINGS_BASE.add(existing as usize);
+            loop {
+                let next = *(eax.add(0x1c) as *const u16);
+                if next == 0 { break; }
+                eax = LEVEL_THINGS_BASE.add((next & 0xffff) as usize);
+            }
+            let last_off = (eax as usize).wrapping_sub(LEVEL_THINGS_BASE as usize) as u16;
+            *(ebx.add(0x1e) as *mut u16) = last_off;
+            *(eax.add(0x1c) as *mut u16) = weapon_off;
+        } else {
+            *(esi.add(0x3a) as *mut u16) = weapon_off;
+            *(ebx.add(0x1e) as *mut u16) = ent_off;
+        }
+
+        *ebx.add(0x0a) |= 0x1;
+        *(ebx.add(0x20) as *mut u16) = ent_off;
+        *esi.add(0x1a) = 0x20;
+        new_state_person(esi);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x32840  fn_S_PERSON_DROP_WEAPON
+//
+// Drop entity's held weapon, animate, and if animation finished call
+// new_state_person with angle 0x20.
+//
+// Literal translation of 0x32840–0x32888.
+// ---------------------------------------------------------------------------
+pub fn fn_s_person_drop_weapon(entity: *mut u8) {
+    use crate::syndre::funcs_20000::animate_model;
+    unsafe {
+        *entity.add(0x54) = 0;
+        drop_weapon(entity);
+        let done = animate_model(entity);
+        if done != 0 {
+            *entity.add(0x1a) = 0x20;
+            new_state_person(entity);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x32870  fn_S_PERSON_SELECT_WEAPON
+//
+// Copy entity.field_0x2c (target weapon offset) into entity.field_0x44
+// (selected weapon) then call new_state_person.
+//
+// Literal translation of 0x32870–0x32900.
+// ---------------------------------------------------------------------------
+pub fn fn_s_person_select_weapon(entity: *mut u8) {
+    unsafe {
+        let dx = *(entity.add(0x2c) as *const u16);
+        *(entity.add(0x44) as *mut u16) = dx;
+        new_state_person(entity);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x32890  fn_S_PERSON_WAIT_FOR_MODEL
+//
+// Wait until entity's map-tile position matches the target entity's tile
+// position (field_0x2c). When aligned, set state 0xd and field_0x2c = 0x14.
+// Always calls affect_person.
+//
+// Literal translation of 0x32890–0x328d4.
+// ---------------------------------------------------------------------------
+pub fn fn_s_person_wait_for_model(entity: *mut u8) {
+    use crate::syndre::data::LEVEL_THINGS_BASE;
+    unsafe {
+        let ebx = entity;
+        let target_link = *(ebx.add(0x2c) as *const u16) as usize;
+        let eax = LEVEL_THINGS_BASE.add(target_link);
+        *ebx.add(0x54) = 0;
+
+        // Compare tile coords (field_0x4 and field_0x6 >> 8)
+        let ex_tile = (*(ebx.add(0x4) as *const i16) as i32) >> 8;
+        let tx_tile = (*(eax.add(0x4) as *const i16) as i32) >> 8;
+        let ey_tile = (*(ebx.add(0x6) as *const i16) as i32) >> 8;
+        let ty_tile = (*(eax.add(0x6) as *const i16) as i32) >> 8;
+
+        if ex_tile == tx_tile && ey_tile == ty_tile {
+            *ebx.add(0x19) = 0xd;
+            *(ebx.add(0x2c) as *mut u16) = 0x14;
+        }
+
+        let new_state = affect_person(ebx) as u8;
+        *ebx.add(0x19) = new_state;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x328e0  fn_S_PERSON_WAIT_FOR_TIME
+//
+// Count down entity.field_0x2c. When it reaches zero (or is > 500), clear
+// field_0x44 and field_0x46 and call new_state_person. Always calls
+// affect_person and stores result in field_0x19.
+//
+// Literal translation of 0x328e0–0x32917.
+// ---------------------------------------------------------------------------
+pub fn fn_s_person_wait_for_time(entity: *mut u8) {
+    unsafe {
+        let ebx = entity;
+        let dx = *(ebx.add(0x2c) as *const u16);
+        *ebx.add(0x54) = 0;
+
+        if dx == 0 || dx > 0x1f4 {
+            *(ebx.add(0x44) as *mut u16) = 0;
+            *ebx.add(0x46) = 0;
+            new_state_person(ebx);
+        } else {
+            *(ebx.add(0x2c) as *mut u16) = dx.wrapping_sub(1);
+        }
+
+        let new_state = affect_person(ebx) as u8;
+        *ebx.add(0x19) = new_state;
     }
 }

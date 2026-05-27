@@ -388,3 +388,142 @@ pub fn quick_decide_on_hug_direction(entity: *mut u8, arg2: u32) {
         // non-cardinal: no state change, fall through
     }
 }
+
+// ---------------------------------------------------------------------------
+// 0x31f60  fn_S_PERSON_STAND
+//
+// Idle-stand state handler. Clears the animation-done flag (field_0x54),
+// clears the moving bit (field_0xa bit 3), runs one animation frame, then
+// calls affect_person to apply any queued effects and update field_0x19.
+//
+// Literal: three-instruction prologue + two calls.
+// ---------------------------------------------------------------------------
+pub fn fn_s_person_stand(entity: *mut u8) {
+    use crate::syndre::funcs_20000::animate_model;
+    unsafe {
+        *entity.add(0x54) = 0;
+        *entity.add(0xa) &= !0x8;
+        animate_model(entity);
+        let new_state = affect_person(entity) as u8;
+        *entity.add(0x19) = new_state;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x31fc0  fn_S_PERSON_NEXT_COMMAND
+//
+// Dequeues the next agent command from the command list and dispatches to
+// the appropriate state handler. Command types 1–11 map to FSM states;
+// unknown types fall through. At the end, advances field_0x26 to cmd[0]
+// (next command link) or entity.field_0x28 if none.
+//
+// Command block layout (at LEVEL_COMMANDS + entity.field_0x26):
+//   [0..1] = u16 next-command link (0 = end of list)
+//   [2..3] = u16 target entity id / vehicle id
+//   [4]    = u8 target x (tile coord, scaled)
+//   [5]    = u8 target y (tile coord, scaled)
+//   [6]    = u8 target z (tile coord, scaled)
+//   [7]    = u8 command type (1-based)
+//
+// Literal: jump-table body reproduced as match; DATA_60B4E pauses dispatch.
+// ---------------------------------------------------------------------------
+pub fn fn_s_person_next_command(entity: *mut u8) {
+    use crate::syndre::data::{LEVEL_COMMANDS, DATA_60B4E};
+    use crate::syndre::funcs_10000::{level_failed, level_complete};
+    unsafe {
+        *entity.add(0x54) = 0;
+        let cmd_link = *(entity.add(0x26) as *const u16);
+        if cmd_link == 0 || DATA_60B4E != 0 { return; }
+
+        let cmd = LEVEL_COMMANDS.add(cmd_link as usize);
+        let cmd_type = (*cmd.add(7)).wrapping_sub(1);
+        if cmd_type > 0x0a { /* unknown: skip to advance step */ }
+        else {
+            match cmd_type {
+                0 => {
+                    // GOTO_POINT: set target coords scaled by 0x80
+                    *entity.add(0x19) = 0x3;
+                    *entity.add(0x58) = 0x3;
+                    let tx = (*cmd.add(4) as u32) << 7 | 0x40;
+                    let ty = (*cmd.add(5) as u32) << 7 | 0x40;
+                    let tz = (*cmd.add(6) as u32) << 7;
+                    *(entity.add(0x2e) as *mut u16) = tx as u16;
+                    *(entity.add(0x30) as *mut u16) = ty as u16;
+                    *(entity.add(0x32) as *mut u16) = tz as u16;
+                }
+                1 => {
+                    // GOTO_VEHICLE (board): if not already in vehicle
+                    if *(entity.add(0x24) as *const u16) == 0 {
+                        *entity.add(0x19) = 0x5;
+                        *entity.add(0x58) = 0x6;
+                        *(entity.add(0x2c) as *mut u16) = *(cmd.add(2) as *const u16);
+                    }
+                }
+                2 => {
+                    // GUARD
+                    *entity.add(0x19) = 0x7;
+                    *entity.add(0x58) = 0x7;
+                }
+                3 => {
+                    // GOTO_VEHICLE2
+                    *entity.add(0x19) = 0xc;
+                    *entity.add(0x58) = 0xc;
+                    *(entity.add(0x2c) as *mut u16) = *(cmd.add(2) as *const u16);
+                }
+                4 => {
+                    // EXIT_VEHICLE
+                    *entity.add(0x19) = 0xd;
+                    *entity.add(0x58) = 0xd;
+                    *(entity.add(0x2c) as *mut u16) = *(cmd.add(2) as *const u16);
+                }
+                5 => {
+                    // GOTO_STRUCTURE
+                    *entity.add(0x19) = 0x5;
+                    *entity.add(0x58) = 0x5;
+                    *(entity.add(0x2c) as *mut u16) = *(cmd.add(2) as *const u16);
+                }
+                6 => {
+                    // MISSION_FAILED
+                    *entity.add(0x19) = 0x0;
+                    *entity.add(0x58) = 0x0;
+                    level_failed();
+                }
+                7 => {
+                    // GOTO_POINT_PRECISE (coords / 2, not tile-scaled)
+                    *entity.add(0x19) = 0x28;
+                    *entity.add(0x58) = 0x28;
+                    let tx = (*cmd.add(4) as i32) >> 1;
+                    let ty = (*cmd.add(5) as i32) >> 1;
+                    let tz = (*cmd.add(6) as u32) << 7;
+                    *(entity.add(0x2e) as *mut i16) = tx as i16;
+                    *(entity.add(0x30) as *mut i16) = ty as i16;
+                    *(entity.add(0x32) as *mut u16) = tz as u16;
+                }
+                8 => {
+                    // GUARD_AREA: clear command queue, switch to guard
+                    *(entity.add(0x26) as *mut u16) = 0;
+                    *entity.add(0x19) = 0x1d;
+                }
+                9 => {
+                    // RESEARCH_PICKUP
+                    *(entity.add(0x2c) as *mut u16) = 0x32;
+                    *entity.add(0x19) = 0x2a;
+                }
+                10 => {
+                    // MISSION_COMPLETE
+                    *entity.add(0x19) = 0x0;
+                    *entity.add(0x58) = 0x0;
+                    level_complete();
+                }
+                _ => unreachable!(),
+            }
+        }
+        // Advance command queue
+        let next_link = *(cmd as *const u16);
+        if next_link != 0 {
+            *(entity.add(0x26) as *mut u16) = next_link;
+        } else {
+            *(entity.add(0x26) as *mut u16) = *(entity.add(0x28) as *const u16);
+        }
+    }
+}

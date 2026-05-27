@@ -9,6 +9,7 @@ pub static mut DATA_5C34C: i32 = 0;   // previous music state
 // ---- Screen / update flags ------------------------------------------------
 pub static mut DATA_5532C: u16 = 0;   // screen update flag
 pub static mut DATA_5532E: u16 = 0;   // screen update flag 2
+pub static mut DATA_60B4E: u8  = 0;   // command processing pause flag
 pub static mut DATA_60B4F: u8  = 0;   // partial-redraw flag
 pub static mut DATA_60B50: u8  = 0;   // scroll speed limiter
 

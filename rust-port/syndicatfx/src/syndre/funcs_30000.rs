@@ -23,6 +23,9 @@ extern "C" {
     fn fatal_weapon(entity: *mut u8) -> u16;
     fn choose_best_weapon(entity: *mut u8, arg2: i32) -> u16;
     fn random(max: i32) -> i32;
+    fn get_angle(dx: i32, dy: i32) -> u8;
+    fn drop_all_weapons(entity: *mut u8);
+    fn kill_all_weapons(entity: *mut u8);
 }
 
 // ---------------------------------------------------------------------------
@@ -1408,5 +1411,355 @@ pub fn fn_s_person_on_fire(entity: *mut u8) {
         goto_angle(speed as i16, angle as u8);
         person_colide(ebx);
         animate_model(ebx);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared helper: compute armor-resistance index from entity.field_0x1d/0x3c.
+// Returns 0-3 (or 4 if immune via bit 0x10 of field_0x1d with dx=0 already).
+// ---------------------------------------------------------------------------
+#[inline]
+unsafe fn armor_resistance(entity: *const u8) -> u32 {
+    let bl = *entity.add(0x1d);
+    if (bl & 0x10) != 0 {
+        return 0; // immune — treat as level 0 (max damage)
+    }
+    let dx = (*(entity.add(0x3c) as *const u16) & 0x60) as u32;
+    dx >> 5
+}
+
+// ---------------------------------------------------------------------------
+// 0x32dc0  fn_S_PERSON_FLY_BACK
+//
+// Knock-back movement. Sets "hurt" flag on field_0xb bit 1, then calls
+// random(speed) to compute fly speed, calls goto_angle + person_colide.
+// Decrements ammo (field_0x14) when DATA_5E128 < -64 (z-fall case).
+// After animation completes: if ammo < 0 → DEAD_ANIM state (0x18), else
+// flip angle 180°, clear on-fire/vehicle bits, set field_0x5b, new_state.
+// Always calls affect_person.
+//
+// Literal translation of 0x32dc0–0x32e87.
+// ---------------------------------------------------------------------------
+pub fn fn_s_person_fly_back(entity: *mut u8) {
+    use crate::syndre::data::DATA_5E128;
+    use crate::syndre::funcs_20000::{move_mapwho, animate_model, goto_angle};
+    unsafe {
+        let ebx = entity;
+        *ebx.add(0x0b) |= 0x2;
+
+        let angle = *ebx.add(0x1a);
+        let speed = *ebx.add(0x54) as i32;
+
+        // Compute randomised fly speed: speed + (random(speed)+2)/2
+        let r = random(speed) as i32;
+        let fly_speed = (speed + (r.wrapping_add(2).unsigned_abs() as i32 >> 1)) as u16;
+        goto_angle(fly_speed as i16, angle);
+
+        // Update speed: (speed+2)/2
+        let new_speed = ((speed.wrapping_add(2)).unsigned_abs() as i32 >> 1) as u8;
+        *ebx.add(0x54) = new_speed;
+        person_colide(ebx);
+
+        // Fall damage
+        if DATA_5E128 < -64 {
+            let ammo = *(ebx.add(0x14) as *const i16);
+            *(ebx.add(0x14) as *mut i16) = ammo.wrapping_sub(1);
+        }
+
+        let done = animate_model(ebx);
+        if done != 0 {
+            if *(ebx.add(0x14) as *const i16) < 0 {
+                *ebx.add(0x19) = 0x18; // DEAD animation state
+            } else {
+                // Flip direction and enter normal-walk recovery
+                let dl = (*ebx.add(0x1a)).wrapping_add(0x80);
+                *ebx.add(0x1a) = dl;
+                let si = *(ebx.add(0x0a) as *const u16) & 0xfdf7;
+                *(ebx.add(0x0a) as *mut u16) = si;
+                *ebx.add(0x5b) = dl;
+                *ebx.add(0x19) = 0x16;
+                new_state_person(ebx);
+            }
+        }
+
+        let new_state = affect_person(ebx) as u8;
+        *ebx.add(0x19) = new_state;
+
+        // Suppress unused import warning
+        let _ = move_mapwho as usize;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x32c10-area  hit-by helper: decode armor resistance and apply ammo damage.
+// Used by HIT_BY_EXPLOSION, HIT_BY_VEHICLE, HIT_BY_FIRE.
+//
+// resist: 0 = no armor (max damage), 1 = light armor, 2 = medium, 3 = heavy.
+// Damage amounts differ per caller; caller sets them in field_0x14 then calls
+// fn_S_PERSON_ON_FIRE or fn_S_PERSON_FLY_BACK.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// 0x32ce0  fn_S_PERSON_HIT_BY_FIRE
+//
+// Dispatch on armor resistance; decrement ammo by 0/8/4/2 per tick or set
+// ammo=-1 (fatal). When ammo goes negative: timer=40, state=ON_FIRE and call
+// fn_S_PERSON_ON_FIRE. When ammo >= 0 near miss: timer=2.
+//
+// Literal translation of 0x32ce0–0x32dbe.
+// ---------------------------------------------------------------------------
+pub fn fn_s_person_hit_by_fire(entity: *mut u8) {
+    unsafe {
+        let eax = entity;
+        let resist = armor_resistance(eax);
+        let ammo_decrement: i16 = match resist {
+            0 => {
+                // Instant burn: set ammo=-1, long timer, ON_FIRE
+                *(eax.add(0x14) as *mut i16) = -1_i16;
+                *(eax.add(0x42) as *mut i16) = 40;
+                *eax.add(0x19) = 0x17;
+                fn_s_person_on_fire(eax);
+                return;
+            }
+            1 => 8,
+            2 => 4,
+            3 => 2,
+            _ => {
+                // dx > 3: fire-resistant; just tick ON_FIRE briefly
+                *eax.add(0x19) = 0x17;
+                fn_s_person_on_fire(eax);
+                return;
+            }
+        };
+        let ammo = (*(eax.add(0x14) as *const i16)).wrapping_sub(ammo_decrement);
+        *(eax.add(0x14) as *mut i16) = ammo;
+        if ammo < 0 {
+            *(eax.add(0x42) as *mut i16) = 40;
+            *eax.add(0x19) = 0x17;
+            fn_s_person_on_fire(eax);
+        } else {
+            *(eax.add(0x42) as *mut i16) = 2;
+            *eax.add(0x19) = 0x17;
+            fn_s_person_on_fire(eax);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x32ea0  fn_S_PERSON_HIT_BY_EXPLOSION
+//
+// Set state=FLY_BACK, copy hug-angle field_0x5b → field_0x1a, speed=0x8c.
+// Damage based on armor resistance: 0→ammo=-1, 2→ammo-=8, 3→ammo-=4.
+// Calls fn_S_PERSON_FLY_BACK.
+//
+// Literal translation of 0x32ea0–0x32f32.
+// ---------------------------------------------------------------------------
+pub fn fn_s_person_hit_by_explosion(entity: *mut u8) {
+    unsafe {
+        let eax = entity;
+        *eax.add(0x19) = 0x16;
+        let bl = *eax.add(0x5b);
+        *eax.add(0x54) = 0x8c;
+        *eax.add(0x1a) = bl;
+        let resist = armor_resistance(eax);
+        match resist {
+            0 => { *(eax.add(0x14) as *mut i16) = -1_i16; }
+            2 => { let a = (*(eax.add(0x14) as *const i16)).wrapping_sub(8); *(eax.add(0x14) as *mut i16) = a; }
+            3 => { let a = (*(eax.add(0x14) as *const i16)).wrapping_sub(4); *(eax.add(0x14) as *mut i16) = a; }
+            _ => {}
+        }
+        fn_s_person_fly_back(eax);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x32f00  fn_S_PERSON_HIT_BY_BULLET
+//
+// Set flags if already dead (field_0x14 < 0), speed=0x54, compute fly
+// angle from attacker position (entity.field_0x16 → attacker, get_angle),
+// state=0x16, then fn_S_PERSON_FLY_BACK.
+//
+// Literal translation of 0x32f00–0x32f66.
+// ---------------------------------------------------------------------------
+pub fn fn_s_person_hit_by_bullet(entity: *mut u8) {
+    use crate::syndre::data::LEVEL_THINGS_BASE;
+    unsafe {
+        let ebx = entity;
+        if *(ebx.add(0x14) as *const i16) < 0 {
+            let ax = *(ebx.add(0x0a) as *const u16) | 0x108;
+            *(ebx.add(0x0a) as *mut u16) = ax;
+        }
+        *ebx.add(0x46) = 0;
+        *ebx.add(0x54) = 0x54;
+
+        let atk_link = *(ebx.add(0x16) as *const u16);
+        let atk = LEVEL_THINGS_BASE.add(atk_link as usize);
+        let dy = (*(ebx.add(0x6) as *const i16)).wrapping_sub(*(atk.add(0x6) as *const i16));
+        let dx = (*(ebx.add(0x4) as *const i16)).wrapping_sub(*(atk.add(0x4) as *const i16));
+
+        let angle = get_angle(dx as i32, dy as i32);
+        *ebx.add(0x1a) = angle;
+        *ebx.add(0x19) = 0x16;
+        fn_s_person_fly_back(ebx);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x32f60  fn_S_PERSON_HIT_BY_VEHICLE
+//
+// Same pattern as HIT_BY_EXPLOSION but speed=0xa0. Damage: 0→-1, 2→-8, 3→-4.
+//
+// Literal translation of 0x32f60–0x32fc0.
+// ---------------------------------------------------------------------------
+pub fn fn_s_person_hit_by_vehicle(entity: *mut u8) {
+    unsafe {
+        let eax = entity;
+        *eax.add(0x19) = 0x16;
+        let bl = *eax.add(0x5b);
+        *eax.add(0x54) = 0xa0;
+        *eax.add(0x1a) = bl;
+        let resist = armor_resistance(eax);
+        match resist {
+            0 => { *(eax.add(0x14) as *mut i16) = -1_i16; }
+            2 => { let a = (*(eax.add(0x14) as *const i16)).wrapping_sub(8); *(eax.add(0x14) as *mut i16) = a; }
+            3 => { let a = (*(eax.add(0x14) as *const i16)).wrapping_sub(4); *(eax.add(0x14) as *mut i16) = a; }
+            _ => {}
+        }
+        fn_s_person_fly_back(eax);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x32fc0  fn_S_PERSON_HIT_BY_LASER
+//
+// Animate first; if animation completes, apply ammo damage based on
+// resistance (0→-1, 2→-8, 3→-4). If ammo < 0: state=DYING(0x19), set
+// dead flags in field_0xa, return. Else clear on-fire/vehicle bits,
+// new_state_person.
+//
+// Literal translation of 0x32fc0–0x3306d.
+// ---------------------------------------------------------------------------
+pub fn fn_s_person_hit_by_laser(entity: *mut u8) {
+    use crate::syndre::funcs_20000::animate_model;
+    unsafe {
+        let ebx = entity;
+        let done = animate_model(ebx);
+        if done != 0 {
+            let resist = armor_resistance(ebx);
+            let ammo_decrement: i16 = match resist {
+                0 => {
+                    *(ebx.add(0x14) as *mut i16) = -1_i16;
+                    -1 // flag
+                }
+                2 => 8,
+                3 => 4,
+                _ => 0,
+            };
+            if ammo_decrement > 0 {
+                let a = (*(ebx.add(0x14) as *const i16)).wrapping_sub(ammo_decrement);
+                *(ebx.add(0x14) as *mut i16) = a;
+            }
+
+            if *(ebx.add(0x14) as *const i16) < 0 {
+                *ebx.add(0x19) = 0x19; // DYING
+                let ax = *(ebx.add(0x0a) as *const u16) | 0x109;
+                *(ebx.add(0x0a) as *mut u16) = ax as u16;
+                return;
+            }
+            let di = *(ebx.add(0x0a) as *const u16) & 0xfdf7;
+            *(ebx.add(0x0a) as *mut u16) = di;
+            new_state_person(ebx);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x33050  fn_S_PERSON_DYING
+//
+// Mark entity as blocking (field_0xa |= 0x8, field_0x54 = 0), drop all
+// weapons, animate. When animation finishes: set state 0x1a (DEAD), then
+// call who_shot_me.
+//
+// Literal translation of 0x33050–0x33087.
+// ---------------------------------------------------------------------------
+pub fn fn_s_person_dying(entity: *mut u8) {
+    use crate::syndre::funcs_20000::animate_model;
+    unsafe {
+        let ebx = entity;
+        let ah = *ebx.add(0x0a) | 0x8;
+        *ebx.add(0x54) = 0;
+        *ebx.add(0x0a) = ah;
+        drop_all_weapons(ebx);
+        let done = animate_model(ebx);
+        if done != 0 {
+            *ebx.add(0x19) = 0x1a;
+            who_shot_me(ebx);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x33090  fn_S_PERSON_DYING_ON_FIRE
+//
+// Set field_0xa |= 0x8, kill all weapons, animate. When done: state=0x1b,
+// set fire timer field_0x42=100, call who_shot_me.
+//
+// Literal translation of 0x33090–0x330ca.
+// ---------------------------------------------------------------------------
+pub fn fn_s_person_dying_on_fire(entity: *mut u8) {
+    use crate::syndre::funcs_20000::animate_model;
+    unsafe {
+        let ebx = entity;
+        *ebx.add(0x0a) |= 0x8;
+        kill_all_weapons(ebx);
+        let done = animate_model(ebx);
+        if done != 0 {
+            *ebx.add(0x19) = 0x1b;
+            *(ebx.add(0x42) as *mut i16) = 0x64;
+            who_shot_me(ebx);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x330d0  fn_S_PERSON_DEAD
+//
+// Set dead flags, zero animation speed, call animate_model (keep playing
+// death animation).
+//
+// Literal translation of 0x330d0–0x330ee.
+// ---------------------------------------------------------------------------
+pub fn fn_s_person_dead(entity: *mut u8) {
+    use crate::syndre::funcs_20000::animate_model;
+    unsafe {
+        let eax = entity;
+        let dx = *(eax.add(0x0a) as *const u16) | 0x108;
+        *eax.add(0x54) = 0;
+        *(eax.add(0x0a) as *mut u16) = dx as u16;
+        animate_model(eax);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0x330f0  fn_S_PERSON_DEAD_ON_FIRE
+//
+// Zero animation speed, count down fire timer (field_0x42). When timer
+// reaches 0: state = 0x23 (ASH). Always set dead flags and animate.
+//
+// Literal translation of 0x330f0–0x33117.
+// ---------------------------------------------------------------------------
+pub fn fn_s_person_dead_on_fire(entity: *mut u8) {
+    use crate::syndre::funcs_20000::animate_model;
+    unsafe {
+        let eax = entity;
+        *eax.add(0x54) = 0;
+        let dx = (*(eax.add(0x42) as *const i16)).wrapping_sub(1);
+        *(eax.add(0x42) as *mut i16) = dx;
+        if dx == 0 {
+            *eax.add(0x19) = 0x23; // ASH state
+        }
+        let cx = *(eax.add(0x0a) as *const u16) | 0x108;
+        *(eax.add(0x0a) as *mut u16) = cx as u16;
+        animate_model(eax);
     }
 }
